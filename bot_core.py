@@ -504,27 +504,36 @@ def birdeye_price_multi(mints: List[str], chain="sol") -> Dict[str, float]:
     except Exception:
         return {}
 
-
 # DexScreener: Volumen/Preis
 def _ds_get_json(url: str, timeout: int = 10) -> dict:
     """
-    Robust: erst über Proxy (_wrap), dann direkt.
-    Gibt bei Nicht-JSON/Fehler immer {} zurück (nie Exception).
+    Robust: erst Proxy (falls DS_PROXY_URL gesetzt), dann Direkt.
+    Akzeptiert JSON auch bei text/plain u.ä. Content-Types.
+    Gibt {} zurück, wenn nichts Brauchbares kam.
     """
     p = _get_ds_proxy()
-    # Wenn Proxy gesetzt: erst Proxy, dann Direkt; sonst nur Direkt
-    urls = [_wrap(url), url] if p else [url]
+    # mit Proxy zuerst versuchen, dann direkt; ohne Proxy nur direkt
+    urls = ([_wrap(url), url] if p else [url])
+
     for u in urls:
         try:
             r = http_get(u, headers=_ds_headers(), timeout=timeout)
             ct = (r.headers.get("content-type") or "").lower()
-            if "application/json" not in ct:
-                continue
-            j = r.json()
-            return j if isinstance(j, (dict, list)) else {}
+            txt = r.text or ""
+            # echte JSON-Response?
+            if "application/json" in ct:
+                j = r.json()
+                return j if isinstance(j, (dict, list)) else {}
+            # manchmal liefert der Proxy text/plain, der aber JSON enthält
+            if txt and txt.lstrip()[:1] in ("{", "["):
+                import json
+                j = json.loads(txt)
+                return j if isinstance(j, (dict, list)) else {}
+            # sonst nächster Versuch
         except Exception:
             continue
     return {}
+
 
 
 async def _get_json(url: str, timeout: int = 10) -> Optional[dict]:
@@ -764,11 +773,15 @@ def ds_token_profiles_latest() -> list[dict]:
 
 def _fetch_pairs_by_token(mint: str) -> list[dict]:
     try:
-        r = http_get(_wrap(f"https://api.dexscreener.com/token-pairs/v1/solana/{mint}"), ...)
+        r = http_get(
+            _wrap(f"https://api.dexscreener.com/token-pairs/v1/solana/{mint}"),
+            headers=_ds_headers(), timeout=10
+        )
         js = r.json() or {}
-        return js if isinstance(js, list) else (js.get("pairs") or [])       
+        return js if isinstance(js, list) else (js.get("pairs") or [])
     except Exception:
         return []
+
 
 def _fetch_pairs_by_pair(pair_id: str) -> list[dict]:
     try:
