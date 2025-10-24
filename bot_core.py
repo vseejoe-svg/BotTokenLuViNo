@@ -336,65 +336,80 @@ client = Client(RPC_URL)
 # =========================
 # HTTP Helpers w/ Backoff
 # =========================
-def _retry_policy_for(url: str, method: str = "GET") -> tuple[int, float, float]:
+# ===== HTTP Helpers + Circuit Breaker (tunable, DS schonend) ================
+import time, random
+
+# Tuning via ENV möglich
+CB_THRESHOLD     = int(os.environ.get("CB_THRESHOLD", "5"))         # Default-Schwelle
+CB_COOLDOWN_SEC  = float(os.environ.get("CB_COOLDOWN_SEC", "60"))    # Default-Cooldown (s)
+
+# globaler, einfacher CB-Zustand (nur für "sensitive" Hosts genutzt)
+CB_FAILS = 0
+CB_OPEN_UNTIL = 0.0
+
+def _retry_policy_for(url: str, method: str = "GET") -> tuple[int, float, float, bool]:
     """
-    Liefert (max_retries, base_delay_s, jitter_max_s) abhängig von Domain/Endpoint.
-    Ohne Call-Site-Änderungen können so Quellen feinjustiert werden.
+    Rückgabe: (max_retry, base_delay, jitter_max, cb_sensitive)
+    cb_sensitive=False => Fehlversuche lösen KEINEN globalen CB aus.
     """
     u = (url or "").lower()
-    # GMGN send_transaction: idempotenzkritisch → max. 1 Retry, langsameres Backoff
+    # GMGN TX: sehr vorsichtig, CB-sensitiv
     if "gmgn.ai/txproxy" in u or "send_transaction" in u:
-        return 1, 0.50, 0.20
-    # GMGN route/quote: moderat
+        return 1, 0.50, 0.20, True
+    # GMGN route/quote: moderat, CB-sensitiv
     if "gmgn.ai" in u and "/defi/router" in u:
-        return 2, 0.50, 0.20
-    # Birdeye: sparsam
+        return 2, 0.50, 0.20, True
+    # Birdeye: sparsam, CB-sensitiv (um Rate-Limits zu respektieren)
     if "public-api.birdeye.so" in u:
-        return 2, 0.25, 0.15
-    # DexScreener: moderat
+        return 2, 0.25, 0.15, True
+    # DexScreener: NICHT CB-sensitiv (häufiger 403/HTML → nicht global blockieren)
     if "api.dexscreener.com" in u:
-        return 3, 0.25, 0.15
-    # Default
-    return HTTP_MAX_RETRY, HTTP_BASE_DELAY, 0.15
+        return 3, 0.25, 0.15, False
+    # Default: CB-sensitiv
+    return CB_THRESHOLD, 0.25, 0.15, True
 
 def http_get(url: str, params=None, headers=None, timeout=15):
     global CB_FAILS, CB_OPEN_UNTIL
-    if time.time() < CB_OPEN_UNTIL:
+    max_retry, base_delay, jitter_max, cb_sensitive = _تق_retry_policy_for(url, "GET") if False else _retry_policy_for(url, "GET")  # guard for copy/paste
+    # CircuitBreaker nur anwenden, wenn sensitives Ziel
+    if cb_sensitive and time.time() < CB_OPEN_UNTIL:
         raise RuntimeError("CircuitBreaker aktiv")
-    max_retry, base_delay, jitter_max = _retry_policy_for(url, "GET")
     for i in range(max_retry):
         try:
             r = requests.get(url, params=params, headers=headers, timeout=timeout)
-            if r.status_code in (429,500,502,503,504):
+            # nur "harte" HTTP-Fehler als Fehler werten
+            if r.status_code in (429, 500, 502, 503, 504):
                 raise RuntimeError(f"HTTP {r.status_code}")
             return r
         except Exception as e:
-            time.sleep(base_delay*(2**i) + random.uniform(0, jitter_max))
+            time.sleep(base_delay * (2 ** i) + random.uniform(0, jitter_max))
             if i == max_retry - 1:
-                CB_FAILS += 1
-                if CB_FAILS >= CB_THRESHOLD:
-                    CB_FAILS = 0
-                    CB_OPEN_UNTIL = time.time() + CB_COOLDOWN_SEC
+                if cb_sensitive:
+                    CB_FAILS += 1
+                    if CB_FAILS >= CB_THRESHOLD:
+                        CB_FAILS = 0
+                        CB_OPEN_UNTIL = time.time() + CB_COOLDOWN_SEC
                 raise RuntimeError(f"GET Fehlversuche erschöpft: {e}")
 
 def http_post(url: str, json_body=None, headers=None, timeout=15):
     global CB_FAILS, CB_OPEN_UNTIL
-    if time.time() < CB_OPEN_UNTIL:
+    max_retry, base_delay, jitter_max, cb_sensitive = _retry_policy_for(url, "POST")
+    if cb_sensitive and time.time() < CB_OPEN_UNTIL:
         raise RuntimeError("CircuitBreaker aktiv")
-    max_retry, base_delay, jitter_max = _retry_policy_for(url, "POST")
     for i in range(max_retry):
         try:
             r = requests.post(url, json=json_body, headers=headers, timeout=timeout)
-            if r.status_code in (429,500,502,503,504):
+            if r.status_code in (429, 500, 502, 503, 504):
                 raise RuntimeError(f"HTTP {r.status_code}")
             return r
         except Exception as e:
-            time.sleep(base_delay*(2**i) + random.uniform(0, jitter_max))
+            time.sleep(base_delay * (2 ** i) + random.uniform(0, jitter_max))
             if i == max_retry - 1:
-                CB_FAILS += 1
-                if CB_FAILS >= CB_THRESHOLD:
-                    CB_FAILS = 0
-                    CB_OPEN_UNTIL = time.time() + CB_COOLDOWN_SEC
+                if cb_sensitive:
+                    CB_FAILS += 1
+                    if CB_FAILS >= CB_THRESHOLD:
+                        CB_FAILS = 0
+                        CB_OPEN_UNTIL = time.time() + CB_COOLDOWN_SEC
                 raise RuntimeError(f"POST Fehlversuche erschöpft: {e}")
 
 # =========================
