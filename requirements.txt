@@ -1,0 +1,16 @@
+python-telegram-bot==21.6
+requests
+httpx
+nest_asyncio
+
+solana>=0.32.0
+solders>=0.26.0
+base58
+PyNaCl
+
+pandas
+fastapi
+uvicorn[standard]
+python-dotenv
+matplotlib
+ujson
