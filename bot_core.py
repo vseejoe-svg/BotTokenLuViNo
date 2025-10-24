@@ -116,6 +116,23 @@ logger = logging.getLogger("autobot")
 # Für echte OHLCV: je Mint den zuletzt verarbeiteten Candle-Zeitstempel merken
 LAST_OHLCV_TS: Dict[str, int] = {}  # mint -> last_processed_time_ms
 
+
+# Nur in Notebook/Colab sinnvoll. In Produktion mit uvicorn/uvloop NICHT patchen.
+try:
+    import asyncio, nest_asyncio
+    loop = None
+    try:
+        # patch nur, wenn bereits eine RUNNING loop existiert
+        loop = asyncio.get_running_loop()
+    except RuntimeError:
+        loop = None  # noch keine laufende Loop -> nicht patchen
+
+    if loop and ("uvloop" not in loop.__class__.__module__):
+        nest_asyncio.apply()
+except Exception:
+    pass
+
+
 # =========================
 # Telegram Hilfsfunktionen
 # =========================
@@ -5619,8 +5636,9 @@ async def _apply_signals(app: Application, mint: str, bar: dict, signals: list[d
 # =========================
 # Starter (Notebook/Colab)
 # =========================
-import nest_asyncio
-nest_asyncio.apply()
+#import nest_asyncio
+#nest_asyncio.apply()
+# Nur in Notebook/Colab sinnvoll. In Produktion mit uvicorn/uvloop NICHT patchen.
 
 async def run_with_reconnect():
     global POLLING_STARTED, APP
