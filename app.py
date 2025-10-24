@@ -12,6 +12,8 @@ logger = logging.getLogger("webhook")
 
 WEBHOOK_SECRET = os.getenv("WEBHOOK_SECRET", "changeme")
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
+PUBLIC_URL = os.getenv("PUBLIC_URL")  # z.B. https://dein-service.onrender.com
+
 if not TELEGRAM_BOT_TOKEN:
     raise ValueError("TELEGRAM_BOT_TOKEN fehlt – bitte in Render → Environment setzen.")
 
@@ -26,14 +28,22 @@ async def on_startup():
     tg_app = await bot_core.build_app()
     bot_core.APP = tg_app  # Referenz für tg_post etc.
 
-    # 2) Initialisieren & internen Worker starten
+    # 2) Initialisieren & PTB-Worker starten
     await tg_app.initialize()
-    try:
-        # alten Webhook löschen (wir nutzen FastAPI + eigenes Secret)
-        await tg_app.bot.delete_webhook(drop_pending_updates=True)
-    except Exception:
-        pass
-    await tg_app.start()  # wichtig: verarbeitet Updates aus update_queue
+
+    # 2a) Webhook setzen/aktualisieren (nicht löschen)
+    if PUBLIC_URL:
+        webhook_url = f"{PUBLIC_URL.rstrip('/')}/webhook/{WEBHOOK_SECRET}"
+        try:
+            await tg_app.bot.set_webhook(
+                url=webhook_url,
+                drop_pending_updates=True  # auf Wunsch auf False setzen, um alte Updates zu behalten
+            )
+            logger.info("Webhook gesetzt: %s", webhook_url)
+        except Exception as exc:
+            logger.exception("Webhook-Setzen fehlgeschlagen: %s", exc)
+
+    await tg_app.start()  # verarbeitet Updates aus tg_app.update_queue
 
     # 3) Optional: Strategieloop automatisch starten
     if os.getenv("AUTOLOOP", "0").lower() in ("1", "true", "yes", "on"):
@@ -54,6 +64,10 @@ async def on_shutdown():
         if tg_app:
             await tg_app.stop()
             await tg_app.shutdown()
+
+@app.get("/")
+async def index():
+    return {"ok": True, "service": "telegram-bot", "hint": "use /health or POST /webhook/<secret>"}
 
 @app.get("/health")
 async def health():
