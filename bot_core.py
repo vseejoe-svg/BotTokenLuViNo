@@ -507,32 +507,38 @@ def birdeye_price_multi(mints: List[str], chain="sol") -> Dict[str, float]:
 # DexScreener: Volumen/Preis
 def _ds_get_json(url: str, timeout: int = 10) -> dict:
     """
-    Robust: erst Proxy (falls DS_PROXY_URL gesetzt), dann Direkt.
-    Akzeptiert JSON auch bei text/plain u.ä. Content-Types.
-    Gibt {} zurück, wenn nichts Brauchbares kam.
+    Robust: Erst via Proxy (falls gültig), sonst direkt.
+    Akzeptiert nur echte JSON-Antworten; bei HTML/Fehlern -> {}.
     """
+    urls = []
     p = _get_ds_proxy()
-    # mit Proxy zuerst versuchen, dann direkt; ohne Proxy nur direkt
-    urls = ([_wrap(url), url] if p else [url])
+    if p:
+        urls.append(_wrap(url))
+    urls.append(url)  # immer auch direkt versuchen
 
     for u in urls:
         try:
             r = http_get(u, headers=_ds_headers(), timeout=timeout)
             ct = (r.headers.get("content-type") or "").lower()
-            txt = r.text or ""
-            # echte JSON-Response?
+            txt = r.text if hasattr(r, "text") else ""
+            # echte JSON?
             if "application/json" in ct:
                 j = r.json()
                 return j if isinstance(j, (dict, list)) else {}
-            # manchmal liefert der Proxy text/plain, der aber JSON enthält
-            if txt and txt.lstrip()[:1] in ("{", "["):
-                import json
-                j = json.loads(txt)
-                return j if isinstance(j, (dict, list)) else {}
-            # sonst nächster Versuch
-        except Exception:
+            # fallback: manche proxy geben falschen CT zurück
+            if txt and txt.lstrip().startswith(("{", "[")):
+                try:
+                    import json
+                    j = json.loads(txt)
+                    if isinstance(j, (dict, list)):
+                        return j
+                except Exception:
+                    pass
+        except Exception as e:
+            # stillschweigend weiter zur nächsten URL
             continue
     return {}
+
 
 
 
@@ -676,19 +682,40 @@ DS_BASE = "https://api.dexscreener.com/latest/dex"
 
 # Live-Proxy (ENV) – erlaubt Umschalten ohne Neustart
 def _get_ds_proxy() -> str:
+    """Gültige Proxy-URL (http/https) oder ''."""
     v = (os.environ.get("DS_PROXY_URL") or "").strip()
-    return v.rstrip("/")
+    if not v:
+        return ""
+    try:
+        u = urlparse(v)
+        if u.scheme in ("http", "https") and u.netloc:
+            return v.rstrip("/")
+    except Exception:
+        pass
+    # ungültig -> ignorieren
+    return ""
 
 def _wrap(url: str) -> str:
+    """
+    Wenn ein gültiger Proxy gesetzt ist, leite Anfragen über:
+      <proxy>/?url=<encoded_target>
+    Sonst Original-URL zurückgeben.
+    """
     p = _get_ds_proxy()
-    return f"{p}/?url={quote_plus(url)}" if p else url
+    if not p:
+        return url
+    return f"{p}/?url={quote_plus(url)}"
 
-def _ds_headers() -> Dict[str, str]:
+def _ds_headers() -> dict:
+    # etwas "echterer" UA + JSON bevorzugen
     return {
-        "Accept": "application/json",
-        "User-Agent": "Mozilla/5.0",
+        "Accept": "application/json, */*;q=0.5",
+        "User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
+                      "(KHTML, like Gecko) Chrome/122.0 Safari/537.36",
         "Referer": "https://dexscreener.com/",
         "Origin":  "https://dexscreener.com",
+        "Cache-Control": "no-cache",
+        "Pragma": "no-cache",
     }
 
 def _safe_float(x, d: float = 0.0) -> float:
@@ -3652,15 +3679,36 @@ async def cmd_dsdiag(update: Update, context: ContextTypes.DEFAULT_TYPE):
 #===============================================================================
 
 async def cmd_set_proxy(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not guard(update): 
+    if not guard(update):
         return
-    arg = (context.args[0].strip() if context.args else "").lower()
-    if arg in ("off","0","none","disable","disabled",""):
-        os.environ.pop("DS_PROXY_URL", None)   # ENV wirklich entfernen
-        await send(update, "🔌 DexScreener‑Proxy: OFF")
-    else:
-        os.environ["DS_PROXY_URL"] = arg.rstrip("/")
-        await send(update, f"🔌 DexScreener‑Proxy: ON → {os.environ['DS_PROXY_URL']}")
+    arg = " ".join(context.args).strip() if context.args else ""
+    if not arg or arg.lower() in ("status", "show"):
+        p = _get_ds_proxy()
+        return await send(
+            update,
+            f"🔌 DexScreener-Proxy: {'ON → ' + p if p else 'OFF'}\n"
+            f"Nutze: /set_proxy off  |  /set_proxy https://dein-proxy.example"
+        )
+
+    if arg.lower() in ("off", "0", "none", "disable", "disabled"):
+        os.environ.pop("DS_PROXY_URL", None)
+        return await send(update, "🔌 DexScreener-Proxy: OFF")
+
+    # sonst: Wert als URL interpretieren
+    val = arg.strip()
+    try:
+        u = urlparse(val)
+        if u.scheme in ("http", "https") and u.netloc:
+            os.environ["DS_PROXY_URL"] = val.rstrip("/")
+            return await send(update, f"🔌 DexScreener-Proxy: ON → {os.environ['DS_PROXY_URL']}")
+        else:
+            return await send(
+                update,
+                "❌ Ungültige URL. Beispiel:\n/set_proxy https://mein-proxy.example"
+            )
+    except Exception:
+        return await send(update, "❌ Konnte URL nicht parsen. Bitte vollständige http(s)-URL angeben.")
+
 #===============================================================================        
 # --- NEU: /trending (kompakte Top-Liste auf Basis der DS-Search) ---
 async def cmd_trending(update: Update, context: ContextTypes.DEFAULT_TYPE):
