@@ -85,6 +85,7 @@ DEFAULT_NOTIONAL_SOL  = float(os.environ.get("DEFAULT_NOTIONAL_SOL","0.10"))
 GMGN_SLIPPAGE_PCT     = float(os.environ.get("GMGN_SLIPPAGE_PCT","0.5"))
 GMGN_FEE_SOL          = float(os.environ.get("GMGN_FEE_SOL","0.003"))
 WATCHLIST             = [s.strip() for s in os.environ.get("WATCHLIST","").split(",") if s.strip()]
+ATR_PC_MIN            = float(os.environ.get("ATR_PC_MIN", "0.30"))
 
 WSOL_MINT = "So11111111111111111111111111111111111111112"
 USDC_MINT = "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v"
@@ -2592,14 +2593,14 @@ class Config:
     tf_sec: float = 5.0
     atr_len: int = 14
     risk_atr: float = 1.2 # 1.6
-    tp1_rr: float = 1.1 # 1.3
-    tp2_rr: float = 2.2 # 2.6
+    tp1_rr: float = 1.5 # 1.3
+    tp2_rr: float = 2.5 # 2.6
     trail_after: bool = True
     trail_atr: float = 1.1 #1
     be_after: bool = True
     min_hold_bars: int = 2 # 3
-    tp1_frac_pc: float = 40.0
-    tp2_frac_pc: float = 50.0
+    tp1_frac_pc: float = 30.0#40.0
+    tp2_frac_pc: float = 60.0#50.0
     snap_lookback: int = 4 # 10
     base_momo: float = 0.1 # 0.2
     k_momo: float = 0.35 # 0.45
@@ -2693,7 +2694,14 @@ class SwingBotV163:
         cur_hour = int(dt.datetime.fromtimestamp(t/1000, UTC).replace(minute=0, second=0, microsecond=0).timestamp())
         if st.last_hour_id != cur_hour: st.last_hour_id = cur_hour; st.trades_this_hour = 0
 
+        # ATR zuerst berechnen
         atr_val = atr_wilder_update(st, h, l, c, cfg.atr_len)
+
+        # ATR%-Gate (in %)
+        atr_pc = (atr_val / c * 100.0) if c else 0.0
+        atr_ok = (atr_pc >= ATR_PC_MIN)
+
+        # DMI/ADX IMMER updaten (auch wenn atr_ok False ist)
         di_pos, di_neg, adx_val = dmi_adx_update(st, h, l, c, cfg.adx_length, cfg.adx_smoothing)
         adx_ok = adx_val > cfg.adx_th
         trend_bias_ok = (di_pos > di_neg) or (adx_val > cfg.adx_th + 2)
@@ -2720,13 +2728,13 @@ class SwingBotV163:
         else: gate_pb = True
 
         vol_ok = (vol_sma50 == 0.0) or (v > vol_sma50 * cfg.vol_mult)
-        entry_signal = (momo_ok or bo_ok) and gate_pb and vol_ok and adx_ok and trend_bias_ok and bbw_ok
+        entry_signal = (atr_ok and (momo_ok or bo_ok) and gate_pb and vol_ok and adx_ok and trend_bias_ok and bbw_ok)
 
         can_enter_time = (st.next_entry_earliest_bar is None) or (st.bar_index >= st.next_entry_earliest_bar)
         hour_ok = st.trades_this_hour < cfg.max_trades_per_hour
         hour_whitelist_ok = self._hour_ok(t)
 
-        self.last_diag = dict(t=t, close=c, vol=v, atr=atr_val, adx=adx_val, momo_ok=momo_ok, momo_pc=momo_pc, momo_thresh=momo_thresh,
+        self.last_diag = dict(t=t, close=c, vol=v, atr=atr_val, adx=adx_val, atr_pc=atr_pc, atr_ok=atr_ok, momo_ok=momo_ok, momo_pc=momo_pc, momo_thresh=momo_thresh,
                               bo_ok=bo_ok, bbw_ok=bbw_ok, gate_pb=gate_pb, vol_ok=vol_ok, entry_signal=entry_signal,
                               hour_ok=hour_ok, hour_whitelist_ok=hour_whitelist_ok)
 
