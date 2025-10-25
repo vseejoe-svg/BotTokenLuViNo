@@ -5666,14 +5666,28 @@ async def _apply_signals(app: Application, mint: str, bar: dict, signals: list[d
         typ = s.get("type")
 
         if typ == "entry" and mint not in OPEN_POS:
-            # 0-Preis-Guard
             if float(bar.get("close") or 0.0) <= 0:
                 continue
             try:
+                # BUY
                 res = await buy_wsol_to_token(mint, DEFAULT_NOTIONAL_SOL, bar["close"])
+                # --- NEU: SL/TPs für die Meldung berechnen ---
+                eng = ENGINES.get(mint)
+                if eng:
+                    st = eng.st; cfg = eng.cfg
+                    entry = float(bar["close"])
+                    atr   = float(eng.last_diag.get("atr") or 0.0)  # zuletzt berechneter ATR auf diesem Bar
+                    # falls du absolut sicher gehen willst, nimm st.sl_abs nach dem Entry:
+                    sl_abs = entry - atr * cfg.risk_atr
+                    R      = entry - sl_abs
+                    tp1_px = entry + cfg.tp1_rr * R
+                    tp2_px = entry + cfg.tp2_rr * R
+                    extra  = f"\nSL≈{sl_abs:.6f}  TP1≈{tp1_px:.6f}  TP2≈{tp2_px:.6f}  (ATR≈{atr:.6f})"
+                else:
+                    extra = ""
                 await app.bot.send_message(
                     ALLOWED_CHAT_ID,
-                    f"🚀 ENTRY {mint[:6]} @~{bar['close']:.6f} | {DEFAULT_NOTIONAL_SOL} SOL\nSig:{res['sig']} {res['status']}"
+                    f"🚀 ENTRY {mint[:6]} @~{bar['close']:.6f} | {DEFAULT_NOTIONAL_SOL} SOL\nSig:{res['sig']} {res['status']}{extra}"
                 )
             except Exception as e:
                 await app.bot.send_message(ALLOWED_CHAT_ID, f"❌ BUY-Fehler {mint[:6]}: {e}")
@@ -5683,15 +5697,15 @@ async def _apply_signals(app: Application, mint: str, bar: dict, signals: list[d
             try:
                 hint = float(bar.get("close") or 0.0)
                 if PAPER_MODE:
-                    # nur Paper-Sell im Paper-Mode
-                    res = await _paper_sell_partial(
-                        mint, frac, mkt_price_hint=hint if hint > 0 else None
-                    )
+                    res = await _paper_sell_partial(mint, frac, mkt_price_hint=hint if hint > 0 else None)
                 else:
                     res = await sell_partial(mint, frac)
+                # Label:
+                label = "TP1" if abs(frac- (ENGINES[mint].cfg.tp1_frac_pc/100.0)) < 1e-6 else \
+                        "TP2" if abs(frac- (ENGINES[mint].cfg.tp2_frac_pc/100.0)) < 1e-6 else "REDUCE"
                 await app.bot.send_message(
                     ALLOWED_CHAT_ID,
-                    f"✅ REDUCE {mint[:6]} {int(frac*100)}% @~{bar['close']:.6f}\nSig:{res['sig']} {res['status']}"
+                    f"✅ {label} {mint[:6]} {int(frac*100)}% @~{bar['close']:.6f}\nSig:{res['sig']} {res['status']}"
                 )
             except Exception as e:
                 await app.bot.send_message(ALLOWED_CHAT_ID, f"❌ Reduce-Fehler {mint[:6]}: {e}")
