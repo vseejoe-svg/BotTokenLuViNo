@@ -74,7 +74,7 @@ AUTO_LIQ_TASK: asyncio.Task | None = None      # z.B. dein auto_liquidity_loop
 #========================================================
 # ===== PAPER MODE (aus ENV, mit Defaults) =====
 PAPER_MODE    = os.environ.get("PAPER_MODE", "0").strip().lower() in ("1", "true", "yes", "on")
-PAPER_FEE_BPS = float(os.environ.get("PAPER_FEE_BPS", "20"))  # 20 bps = 0.20 %
+PAPER_FEE_BPS = float(os.environ.get("PAPER_FEE_BPS", "10"))  # 20 bps = 0.20 %
 #--------------------------------------------------
 # Bot App-Pointer (wird via /boot gebaut)
 APP: Application | None = None
