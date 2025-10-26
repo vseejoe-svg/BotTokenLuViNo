@@ -62,7 +62,6 @@ if not HELIUS_API_KEY:
     except Exception:
         pass
 #========================================================
-#========================================================
 #iÄNDERUNGEN ANPASSUNG WEGEN RENDER
 import asyncio
 # Globale Task-Handles (nur Background-Loops; KEIN Polling!)
@@ -70,7 +69,6 @@ APP = None
 AUTO_TASK: asyncio.Task | None = None          # z.B. dein auto_loop
 AUTOWATCH_TASK: asyncio.Task | None = None     # z.B. dein autowatch_loop
 AUTO_LIQ_TASK: asyncio.Task | None = None      # z.B. dein auto_liquidity_loop
-#========================================================
 #========================================================
 # ===== PAPER MODE (aus ENV, mit Defaults) =====
 PAPER_MODE    = os.environ.get("PAPER_MODE", "0").strip().lower() in ("1", "true", "yes", "on")
@@ -116,6 +114,9 @@ logger = logging.getLogger("autobot")
 
 # Für echte OHLCV: je Mint den zuletzt verarbeiteten Candle-Zeitstempel merken
 LAST_OHLCV_TS: Dict[str, int] = {}  # mint -> last_processed_time_ms
+
+# --- Liquidity-Gate für ADD (mind. X on-chain Refs) ---
+AW_ADD_REQUIRE_REFS = int(os.environ.get("AW_ADD_REQUIRE_REFS", "1"))
 
 
 # Nur in Notebook/Colab sinnvoll. In Produktion mit uvicorn/uvloop NICHT patchen.
@@ -1442,20 +1443,36 @@ async def aw_discover_once() -> dict:
                 return "observe"
 
             return "drop"
-
+            
         to_add: list[Candidate] = []
         for c in to_check:
             bucket = _classify(c)
+
             if bucket == "add":
+                # --- NEU: optionales Liquidity-Gate vor ADD ---
+                if AW_ADD_REQUIRE_REFS > 0:
+                    try:
+                        refs = await _count_liquidity_refs_async(c.mint)
+                        total_refs = int(refs.get("total_liq_refs", 0))
+                        if total_refs < AW_ADD_REQUIRE_REFS:
+                             # zu wenig on-chain Pools -> zunächst persistente Observe-Merkliste
+                            observed.append((c.mint, c.symbol))
+                            AW_STATE.setdefault("observed", {})[c.mint] = {"sym": c.symbol, "ts": now}
+                            continue  # NICHT adden
+                    except Exception:
+                        # im Zweifel konservativ: erst Observe
+                        observed.append((c.mint, c.symbol))
+                        AW_STATE.setdefault("observed", {})[c.mint] = {"sym": c.symbol, "ts": now}
+                        continue
+
+                # Gate bestanden -> in ADD-Liste
                 to_add.append(c)
+
             elif bucket == "observe":
                 observed.append((c.mint, c.symbol))
                 # refresh / persist Observe
-                try:
-                    obs_map[c.mint] = {"sym": c.symbol, "ts": now}
-                except Exception:
-                    pass
-            # drop → nichts persistieren
+                AW_STATE.setdefault("observed", {})[c.mint] = {"sym": c.symbol, "ts": now}
+            # else: drop -> nichts tun
 
         # 6) Add in die Watchlist (kappen bei max_size)
         for c in to_add:
@@ -1471,8 +1488,10 @@ async def aw_discover_once() -> dict:
                 "source": AW_CFG["hotlist"] or "search",
             }
             added.append((c.mint, c.symbol))
-            # falls zuvor in Observe → entfernen
-            obs_map.pop(c.mint, None)
+            try:
+                obs_map.pop(c.mint, None)
+            except Exception:
+                pass
 
         # 7) Prune (Inaktivität/Alter)
         for m in list(WATCHLIST):
@@ -2624,7 +2643,7 @@ class Config:
     pause_minutes: int = 10 # 15
     max_trades_per_hour: int = 30 # 24
     time_exit_bars: int = 60 # 900
-    allowed_hours_csv: str  = ""
+    allowed_hours_csv: str  = "2,3,4,5,10,11,12,13,14,15,16,23"
 
 @dataclass
 class State:
@@ -2799,19 +2818,19 @@ CONFIG_1M = Config(
     # Risiko/Targets (1m etwas enger/glatter)
     atr_len=3,
     risk_atr=1.15,
-    tp1_rr=1.25,
-    tp2_rr=2.40,
+    tp1_rr=1.5,
+    tp2_rr=3.10,
     trail_after=True,
     trail_atr=1.20,
     be_after=True,
 
     # Mindesthaltezeit/Exits in Bars (1m)
-    min_hold_bars=4,
+    min_hold_bars=2,
     time_exit_bars=75,
 
     # Teilverkäufe
-    tp1_frac_pc=40.0,
-    tp2_frac_pc=50.0,
+    tp1_frac_pc=30.0,
+    tp2_frac_pc=60.0,
 
     # Entry-Logik skaliert
     snap_lookback=3,
@@ -2838,11 +2857,11 @@ CONFIG_1M = Config(
     # Cooldowns/Limits 1m
     cool_sec=180,
     loss_cool=600,
-    sl_cool_sec=300,
+    sl_cool_sec=600,
     pause_after_losses=3,
     pause_minutes=12,
-    max_trades_per_hour=12,
-    allowed_hours_csv="",
+    max_trades_per_hour=8,
+    allowed_hours_csv="2,3,4,5,10,11,12,13,14,15,16,23",
 )
 
 # =========================
