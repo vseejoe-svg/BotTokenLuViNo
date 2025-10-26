@@ -83,7 +83,7 @@ DEFAULT_NOTIONAL_SOL  = float(os.environ.get("DEFAULT_NOTIONAL_SOL","0.10"))
 GMGN_SLIPPAGE_PCT     = float(os.environ.get("GMGN_SLIPPAGE_PCT","0.5"))
 GMGN_FEE_SOL          = float(os.environ.get("GMGN_FEE_SOL","0.003"))
 WATCHLIST             = [s.strip() for s in os.environ.get("WATCHLIST","").split(",") if s.strip()]
-ATR_PC_MIN            = float(os.environ.get("ATR_PC_MIN", "0.30"))
+ATR_PC_MIN            = float(os.environ.get("ATR_PC_MIN", "0.35"))
 
 WSOL_MINT = "So11111111111111111111111111111111111111112"
 USDC_MINT = "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v"
@@ -117,7 +117,6 @@ LAST_OHLCV_TS: Dict[str, int] = {}  # mint -> last_processed_time_ms
 
 # --- Liquidity-Gate für ADD (mind. X on-chain Refs) ---
 AW_ADD_REQUIRE_REFS = int(os.environ.get("AW_ADD_REQUIRE_REFS", "1"))
-
 
 # Nur in Notebook/Colab sinnvoll. In Produktion mit uvicorn/uvloop NICHT patchen.
 try:
