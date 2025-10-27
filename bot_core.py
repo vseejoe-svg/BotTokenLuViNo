@@ -627,26 +627,45 @@ def _ds_pick_best_sol_pair(pairs: list[dict]) -> dict | None:
 
 _DEX_CACHE: Dict[str, Tuple[float, float]] = {}
 def dexscreener_usd_1m_approx(mint: str, ttl_sec: int = 45) -> float:
-    """≈1m-Volumen aus h1/h24 ableiten. DS proxy-aware + headers + cache."""
+    """
+    Liefert eine grobe Schätzung des USD-Volumens pro Minute (≈1m) für ein Mint.
+    Quelle: DexScreener (volume.h1 bzw. fallback auf volume.h24).
+    Nutzt Proxy-aware Fetch (_ds_get_json), wählt das liquideste Solana-Pair
+    (_ds_pick_best_sol_pair) und cached Ergebnisse kurzzeitig in _DEX_CACHE.
+    """
     now = time.time()
-    if mint in _DEX_CACHE and now - _DEX_CACHE[mint][1] < ttl_sec:
-        return _DEX_CACHE[mint][0]
+
+    # Cache-Hit?
     try:
-        js = _ds_get_json(f"https://api.dexscreener.com/token-pairs/v1/solana/{mint}")
-        pairs = js if isinstance(js, list) else (js.get("pairs") or [])
-        best = _ds_pick_best_sol_pair(pairs)
-        if not best:
-            _DEX_CACHE[mint] = (0.0, now)
-            return 0.0
-        vol = best.get("volume") or {}
-        h1  = float(vol.get("h1") or 0.0)
-        h24 = float(vol.get("h24") or 0.0)
-        vpm = (h1 / 60.0) if h1 > 0 else ((h24 / 1440.0) if h24 > 0 else 0.0)
-        _DEX_CACHE[mint] = (vpm, now)
-        return vpm
+        cached_val, cached_ts = _DEX_CACHE.get(mint, (None, 0.0))
+        if cached_val is not None and (now - float(cached_ts)) < float(ttl_sec):
+            return float(cached_val)
     except Exception:
-        _DEX_CACHE[mint] = (0.0, now)
-        return 0.0
+        pass
+
+    vpm = 0.0
+    try:
+        js = _ds_get_json(f"https://api.dexscreener.com/token-pairs/v1/solana/{mint}", timeout=10)
+        pairs = js if isinstance(js, list) else (js.get("pairs") or js.get("data") or [])
+        best = _ds_pick_best_sol_pair(pairs) if pairs else None
+
+        if best:
+            vol = best.get("volume") or {}
+            h1  = float(vol.get("h1")  or 0.0)
+            h24 = float(vol.get("h24") or 0.0)
+
+            if h1 > 0:
+                vpm = h1 / 60.0
+            elif h24 > 0:
+                vpm = h24 / 1440.0
+    except Exception:
+        vpm = 0.0
+
+    # Immer cachen (auch 0.0), damit wir kurzfristig nicht spammen
+    vpm = max(0.0, float(vpm))
+    _DEX_CACHE[mint] = (vpm, now)
+    return vpm
+
 
 def dexscreener_price_usd(mint: str) -> float:
     """Preis in USD (bestes Solana-Paar). DS proxy-aware + headers."""
