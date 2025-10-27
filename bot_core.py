@@ -5863,8 +5863,14 @@ async def auto_loop(app: Application):
       1) Versucht echte 60s-OHLCV von Birdeye; verarbeitet NUR neue Bars (ts > LAST_OHLCV_TS)
       2) Fällt zurück auf 5s-OHLCV; danach auf Builder (Preis-Fallback-Stack + DexScreener-Volumen)
       3) Zeit-getaktete Debugausgabe (DEBUG_SCAN_SEC) inkl. Quelle + HTTP-Status
+      4) NEU: periodischer Memory-Sweep für stale Mint-States
     """
     global DEBUG_SCAN
+
+    # ───────────────────── NEW: Sweep-Config (vor while True) ─────────────────────
+    last_sweep = 0
+    SWEEP_EVERY = int(os.getenv("STATE_SWEEP_EVERY_SEC", "300"))
+    # ──────────────────────────────────────────────────────────────────────────────
 
     while True:
         try:
@@ -5976,14 +5982,12 @@ async def auto_loop(app: Application):
 
                     if DEBUG_SCAN and (time.time() - _last_debug_ts.get(mint, 0.0) >= DEBUG_SCAN_SEC):
                         diag = ENGINES[mint].last_diag
-                        # direkt vor tg_post(...) in beiden Pfaden (OHLCV & builder)
                         st = ENGINES[mint].st
                         cfg = ENGINES[mint].cfg
-                        # Zeit-Check (UTC): nimm bar['time'] falls vorhanden, sonst now_ms
                         tms = int(bar["time"]) if isinstance(bar, dict) and "time" in bar else now_ms
                         hour_ok  = ENGINES[mint]._hour_ok(tms)
                         cool_ok  = (st.next_entry_earliest_bar is None) or (st.bar_index >= (st.next_entry_earliest_bar or 0))
-                        open_ok  = (mint not in OPEN_POS)   
+                        open_ok  = (mint not in OPEN_POS)
                         cap_ok   = (st.trades_this_hour < cfg.max_trades_per_hour)
 
                         await tg_post(
@@ -5999,19 +6003,22 @@ async def auto_loop(app: Application):
                             )
                         )
                         _last_debug_ts[mint] = time.time()
-            
+
+            # ───────────────────── NEW: Memory-Sweep (nach der Mint-Schleife) ─────────────────────
             if time.time() - last_sweep > SWEEP_EVERY:
                 live = set(WATCHLIST) | set(OPEN_POS.keys())
                 for m in list(ENGINES.keys()):
                     if m not in live:
                         _drop_mint_state(m)
                 last_sweep = time.time()
-                
+            # ─────────────────────────────────────────────────────────────────────────────────────
+
             await asyncio.sleep(1.0)
 
         except Exception as e:
             logger.exception(f"[auto_loop] Fehler: {e}")
             await asyncio.sleep(2.0)
+
 
 async def _apply_signals(app: Application, mint: str, bar: dict, signals: list[dict]):
     """
