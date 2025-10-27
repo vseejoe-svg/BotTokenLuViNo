@@ -121,9 +121,10 @@ AW_ADD_REQUIRE_REFS = int(os.environ.get("AW_ADD_REQUIRE_REFS", "1"))
 # --- AutoWatch Timing ---
 AW_ENABLED_DEFAULT = int(os.environ.get("AW_ENABLED_DEFAULT", "1"))
 AW_INTERVAL_SEC    = int(os.environ.get("AW_INTERVAL_SEC", "60"))
-AW_RUN_TIMEOUT_SEC = int(os.environ.get("AW_RUN_TIMEOUT_SEC", "90"))
+AW_RUN_TIMEOUT_SEC = int(os.environ.get("AW_RUN_TIMEOUT_SEC", "180"))
 
-ALLOWED_HOURS_TZ_OFFSET_MIN = int(os.environ.get("ALLOWED_HOURS_TZ_OFFSET_MIN", "60"))
+# --- Trading-Zeitfenster (lokale Stunden)
+ALLOWED_HOURS_TZ_OFFSET_MIN = int(os.environ.get("ALLOWED_HOURS_TZ_OFFSET_MIN", "0"))
 
 # Nur in Notebook/Colab sinnvoll. In Produktion mit uvicorn/uvloop NICHT patchen.
 try:
@@ -1234,7 +1235,7 @@ AW_CFG = {
     "sscore_min_add":     max(0, min(100, int(os.environ.get("AW_SSCORE_MIN_ADD", "70")))),
     "sscore_min_observe": max(0, min(100, int(os.environ.get("AW_SSCORE_MIN_OBS", "60")))),    
     "mom_enable":        (os.environ.get("AW_MOM_PASS_ENABLE","1").strip().lower() in ("1","true","yes","on")),
-    "mom_top":           int(os.environ.get("AW_MOM_TOP","12")),
+    "mom_top":           int(os.environ.get("AW_MOM_TOP","8")),
     "mom_max_age":       int(os.environ.get("AW_MOM_MAX_AGE","180")),
     "mom_min_lp":      float(os.environ.get("AW_MOM_MIN_LP","0.3")),
     "mom_min_vol":     float(os.environ.get("AW_MOM_MIN_VOL","300")),
@@ -5300,18 +5301,13 @@ async def cmd_autowatch(update: Update, context: ContextTypes.DEFAULT_TYPE):
     
 #===============================================================================
 async def cmd_aw_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not guard(update):
+    if not guard(update): 
         return
-
-    # Quelle für "last run"
-    last = int(AW_STATE.get("last_run_ts") or 0)
     nwl  = len(WATCHLIST)
-
+    last = int(AW_STATE.get("last_run_ts") or 0)
     if last > 0:
-        # Nutzt die oben definierte UTC-Konstante für Kompatibilität
-        last_str = dt.datetime.fromtimestamp(last, UTC).strftime('%Y-%m-%d %H:%M:%S') + "Z"
-        age_sec  = int(time.time()) - last
-        age_str  = f"{age_sec}s ago"
+        last_str = dt.datetime.fromtimestamp(last, dt.UTC).strftime("%Y-%m-%d %H:%M:%S") + "Z"
+        age_str  = f"{int(time.time()) - last}s ago"
     else:
         last_str = "n/a"
         age_str  = "n/a"
@@ -5322,7 +5318,8 @@ async def cmd_aw_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"last run: {last_str} ({age_str})",
         *(_aw_cfg_snapshot_text()),
     ]
-    await send(update, "\n".join(lines))   
+    await send(update, "\n".join(lines))
+   
 #===============================================================================
 
 async def cmd_aw_now(update: Update, context: ContextTypes.DEFAULT_TYPE):
