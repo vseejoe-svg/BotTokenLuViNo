@@ -129,6 +129,13 @@ ALLOWED_HOURS_TZ_OFFSET_MIN = int(os.environ.get("ALLOWED_HOURS_TZ_OFFSET_MIN", 
 # Begrenze die Historie pro Mint (Default 3000 Bars; via ENV SERIES_MAXLEN anpassbar)
 SERIES_MAXLEN = int(os.getenv("SERIES_MAXLEN", "3000"))
 
+# ==== SANITY PERF KNOBS (per ENV steuerbar) ==============================
+SANITY_ENABLE_MORALIS = os.getenv("SANITY_ENABLE_MORALIS", "0").lower() in ("1","true","on","yes")
+SANITY_SKIP_USDC_ROUTE = os.getenv("SANITY_SKIP_USDC_ROUTE", "1").lower() in ("1","true","on","yes")
+SANITY_GMGN_TIMEOUT    = int(os.getenv("SANITY_GMGN_TIMEOUT",  "8"))  # vorher 20
+SANITY_RPC_TIMEOUT     = int(os.getenv("SANITY_RPC_TIMEOUT",   "8"))  # vorher 15
+SANITY_MAX_TX_SAMPLES  = int(os.getenv("SANITY_MAX_TX_SAMPLES", "6")) # vorher 25
+
 # Nur in Notebook/Colab sinnvoll. In Produktion mit uvicorn/uvloop NICHT patchen.
 try:
     import asyncio, nest_asyncio
@@ -1233,7 +1240,7 @@ AW_PRUNE_INACTIVE_MIN   = int(os.getenv("AW_PRUNE_INACTIVE_MIN", 10))
 AW_PRUNE_AGE_MAX_MIN    = int(os.getenv("AW_PRUNE_AGE_MAX_MIN", 0))
 AW_MAX_WATCHLIST        = int(os.getenv("AW_MAX_WATCHLIST", 25))
 AW_M5_DELTA             = float(os.getenv("AW_M5_DELTA", 0))
-AW_SANITY_CONC          = int(os.getenv("AW_SANITY_CONC", 1))
+AW_SANITY_CONC          = int(os.getenv("AW_SANITY_CONC", 6))
 AW_QSCORE_MIN_ADD       = int(os.environ.get("AW_QSCORE_MIN_ADD", "60"))
 AW_QSCORE_MIN_OBS       = int(os.environ.get("AW_QSCORE_MIN_OBS", "40"))
 AW_SSCORE_MIN_ADD       = int(os.environ.get("AW_SSCORE_MIN_ADD", "70"))
@@ -1743,34 +1750,48 @@ async def _count_liquidity_refs_async(mint: str) -> dict:
 async def _recent_activity_60m(best_pair_addr: Optional[str]) -> dict:
     """
     Best-effort Aktivität: distinct signers & tx count der letzten ~60m.
-    - Wenn keine Pair-Address vorhanden: leere Werte.
-    - RPC getSignaturesForAddress + getTransaction (max 25 Reads).
+    Gekappt über ENV:
+      - SANITY_RPC_TIMEOUT (pro RPC Call)
+      - SANITY_MAX_TX_SAMPLES (getTransaction-Stichproben)
+    Außerdem harte Laufzeitbremse (≈ 2 * SANITY_RPC_TIMEOUT).
     """
     out = {"tx_60m": 0, "uniq_signers_60m": 0}
     if not best_pair_addr:
         return out
+
+    t0 = time.time()
+    budget = SANITY_RPC_TIMEOUT * 2  # Gesamtbudget für diese Routine
+
     try:
-        # 1) Signatures (max 100)
-        sigs = _rpc("getSignaturesForAddress", [best_pair_addr, {"limit": 100}]).get("result") or []
+        # 1) Signatures (max 100), gefiltert auf ~60m
+        sigs = _rpc("getSignaturesForAddress",
+                    [best_pair_addr, {"limit": 100}],
+                    timeout=SANITY_RPC_TIMEOUT).get("result") or []
         now = time.time()
         recent = [s for s in sigs if (abs(int(s.get("blockTime") or now) - now) <= 3600)]
         out["tx_60m"] = len(recent)
 
-        # 2) einige Transaktionen lesen (max 25, um RPC zu schonen)
+        # 2) nur wenige Transaktionen lesen (gedrosselt)
         uniq = set()
-        for s in recent[:25]:
-            sig = s.get("signature"); 
-            if not sig: continue
-            tx = _rpc("getTransaction", [sig, {"encoding":"json"}]).get("result") or {}
+        for s in recent[:max(0, SANITY_MAX_TX_SAMPLES)]:
+            if time.time() - t0 > budget:
+                break
+            sig = s.get("signature")
+            if not sig:
+                continue
+            tx = _rpc("getTransaction", [sig, {"encoding": "json"}], timeout=SANITY_RPC_TIMEOUT).get("result") or {}
             msg = ((tx.get("transaction") or {}).get("message") or {})
             accs = msg.get("accountKeys") or []
             if accs:
-                # accountKeys[0] ist typischerweise der Fee-Payer/Signer
-                uniq.add(accs[0].get("pubkey") if isinstance(accs[0], dict) else accs[0])
+                a0 = accs[0]
+                uniq.add(a0.get("pubkey") if isinstance(a0, dict) else a0)
+
         out["uniq_signers_60m"] = len(uniq)
     except Exception:
+        # best effort → still ok
         pass
     return out
+
 
 # ------------------------ Holder/Concentration --------------------------------
 def _moralis_top_share(mint: str, limit: int = 10) -> Optional[float]:
@@ -1875,14 +1896,17 @@ async def sanity_check_token(
     if (age_min is not None) and (age_min < min_age_min): rep["issues"].append("very_new"); rep["score"]-=10
 
     # b) Route-Check (KO nur wSOL)
+        # b) Route-Check (KO nur wSOL)
     try:
         _ = gmgn_get_route_safe(WSOL_MINT, mint, lamports(0.01), WALLET_PUBKEY, GMGN_SLIPPAGE_PCT, GMGN_FEE_SOL)
     except Exception:
         rep["issues"].append("route_wsol_fail"); rep["score"] -= 15; rep["ok"] = False
-    try:
-        _ = gmgn_get_route_safe(USDC_MINT, mint, 1_000_000, WALLET_PUBKEY, GMGN_SLIPPAGE_PCT, GMGN_FEE_SOL)
-    except Exception:
-        rep["issues"].append("route_usdc_fail"); rep["score"] -= 8
+
+    if not SANITY_SKIP_USDC_ROUTE:
+        try:
+            _ = gmgn_get_route_safe(USDC_MINT, mint, 1_000_000, WALLET_PUBKEY, GMGN_SLIPPAGE_PCT, GMGN_FEE_SOL)
+        except Exception:
+            rep["issues"].append("route_usdc_fail"); rep["score"] -= 8
 
     # c) Liquidity-Refs
     liq_refs = await _count_liquidity_refs_async(mint)
@@ -1912,7 +1936,7 @@ async def sanity_check_token(
         rep["issues"].append("no_mint_info"); rep["score"] -= 5
 
     # f) Holder-Konzentration + Burn-Anteil (Moralis optional)
-    share = _moralis_top_share(mint, limit=10)
+    share = _moralis_top_share(mint, limit=10) if SANITY_ENABLE_MORALIS else None
     largest = []
     if share is None:
         try:
@@ -1920,22 +1944,25 @@ async def sanity_check_token(
             top10 = sum(float(a.get("uiAmount") or 0.0) for a in largest[:10])
             ts = await asyncio.to_thread(client.get_token_supply, Pubkey.from_string(mint))
             try:
-                supply_total = int(ts.value.amount)/(10**int(ts.value.decimals))
+                supply_total = int(ts.value.amount) / (10 ** int(ts.value.decimals))
             except Exception:
                 dec = await get_mint_decimals_async(mint)
-                supply_total = float(getattr(ts.value,"ui_amount_string",0.0)) or (int(ts.value.amount)/(10**dec))
-            share = (top10/supply_total) if supply_total>0 else None
+                supply_total = float(getattr(ts.value, "ui_amount_string", 0.0)) or (int(ts.value.amount) / (10 ** dec))
+            share = (top10 / supply_total) if supply_total > 0 else None
         except Exception:
             share = None
+
     if share is not None:
         rep["metrics"]["top10_share"] = share
-        if share >= 0.90: rep["issues"].append("top10_concentration_very_high"); rep["score"] -= 15; rep["ok"]=False
-        elif share >= 0.80: rep["issues"].append("top10_concentration_high");   rep["score"] -= 8
+        if share >= 0.90: rep["issues"].append("top10_concentration_very_high"); rep["score"] -= 15; rep["ok"] = False
+        elif share >= 0.80: rep["issues"].append("top10_concentration_high"); rep["score"] -= 8
         elif share >= 0.70: rep["issues"].append("top10_concentration_elevated"); rep["score"] -= 4
 
     if not largest:
-        try: largest = rpc_get_token_largest_accounts(mint, top_n=10)
-        except Exception: largest = []
+        try:
+            largest = rpc_get_token_largest_accounts(mint, top_n=10)
+        except Exception:
+            largest = []
     burn_share = _burn_share_from_list(largest) if largest else 0.0
     rep["metrics"]["burn_share_top10"] = burn_share
     if burn_share >= 0.05: rep["score"] += 2
@@ -2029,7 +2056,7 @@ def gmgn_get_route(token_in: str, token_out: str, in_amount: int,
         "antiMev": "true" if anti_mev else "false",     # Alias
     }
 
-    r = http_get(url, params=params, headers=hdr, timeout=20)
+    r = http_get(url, params=params, headers=hdr, timeout=SANITY_GMGN_TIMEOUT)
     ct = (r.headers.get("content-type") or "").lower()
     if "application/json" not in ct:
         raise RuntimeError(f"GMGN non-json ct={ct}")
