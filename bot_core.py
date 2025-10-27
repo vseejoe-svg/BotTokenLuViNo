@@ -132,9 +132,9 @@ SERIES_MAXLEN = int(os.getenv("SERIES_MAXLEN", "3000"))
 # ==== SANITY PERF KNOBS (per ENV steuerbar) ==============================
 SANITY_ENABLE_MORALIS = os.getenv("SANITY_ENABLE_MORALIS", "0").lower() in ("1","true","on","yes")
 SANITY_SKIP_USDC_ROUTE = os.getenv("SANITY_SKIP_USDC_ROUTE", "1").lower() in ("1","true","on","yes")
-SANITY_GMGN_TIMEOUT    = int(os.getenv("SANITY_GMGN_TIMEOUT",  "8"))  # vorher 20
 SANITY_RPC_TIMEOUT     = int(os.getenv("SANITY_RPC_TIMEOUT",   "8"))  # vorher 15
 SANITY_MAX_TX_SAMPLES  = int(os.getenv("SANITY_MAX_TX_SAMPLES", "6")) # vorher 25
+GMGN_HTTP_TIMEOUT = int(os.getenv("GMGN_HTTP_TIMEOUT", "20"))
 
 # Nur in Notebook/Colab sinnvoll. In Produktion mit uvicorn/uvloop NICHT patchen.
 try:
@@ -1896,7 +1896,6 @@ async def sanity_check_token(
     if (age_min is not None) and (age_min < min_age_min): rep["issues"].append("very_new"); rep["score"]-=10
 
     # b) Route-Check (KO nur wSOL)
-        # b) Route-Check (KO nur wSOL)
     try:
         _ = gmgn_get_route_safe(WSOL_MINT, mint, lamports(0.01), WALLET_PUBKEY, GMGN_SLIPPAGE_PCT, GMGN_FEE_SOL)
     except Exception:
@@ -2056,7 +2055,7 @@ def gmgn_get_route(token_in: str, token_out: str, in_amount: int,
         "antiMev": "true" if anti_mev else "false",     # Alias
     }
 
-    r = http_get(url, params=params, headers=hdr, timeout=SANITY_GMGN_TIMEOUT)
+    r = http_get(url, params=params, headers=hdr, timeout=GMGN_HTTP_TIMEOUT)
     ct = (r.headers.get("content-type") or "").lower()
     if "application/json" not in ct:
         raise RuntimeError(f"GMGN non-json ct={ct}")
