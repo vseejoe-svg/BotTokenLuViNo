@@ -1362,19 +1362,42 @@ async def _aw_check_activity_and_age(mint: str) -> tuple[bool, int, int | None]:
 #=================================================================================================
 
 async def _aw_sanity_batch(mints: list[str]) -> dict[str, dict]:
+    """
+    Sanity parallelisiert, aber mit pro-Token Timeout und sauberem Cancel,
+    damit überhängende Tasks nicht den nächsten Run blockieren.
+    """
     res: dict[str, dict] = {}
-    sem = asyncio.Semaphore(AW_CFG["sanity_conc"])
+    sem = asyncio.Semaphore(AW_CFG.get("sanity_conc", 4))
+    tasks: list[asyncio.Task] = []
+
     async def _run(m: str) -> tuple[str, dict]:
         async with sem:
             try:
-                r = await sanity_check_token(m)
+                # pro-Token hart begrenzen
+                r = await asyncio.wait_for(sanity_check_token(m), timeout=12)
+                return m, r
+            except asyncio.TimeoutError:
+                return m, {"ok": False, "score": 0, "issues": ["sanity_timeout"], "metrics": {}}
             except Exception as e:
-                r = {"ok": False, "score": 0, "issues": [f"err:{e}"], "metrics": {}}
-            return m, r
-    tasks = [asyncio.create_task(_run(m)) for m in mints]
-    for t in asyncio.as_completed(tasks):
-        m, r = await t
-        res[m] = r
+                return m, {"ok": False, "score": 0, "issues": [f"err:{e}"], "metrics": {}}
+
+    for m in mints:
+        tasks.append(asyncio.create_task(_run(m)))
+
+    try:
+        for t in asyncio.as_completed(tasks):
+            m, r = await t
+            res[m] = r
+    finally:
+        # hängende Tasks beenden, falls der aufrufende Run cancelled wurde
+        for t in tasks:
+            if not t.done():
+                t.cancel()
+                try:
+                    await t
+                except Exception:
+                    pass
+
     return res
 
 #=================================================================================================
@@ -1392,14 +1415,11 @@ def _aw_cfg_snapshot_text() -> list[str]:
 #=================================================================================================
 async def aw_discover_once() -> dict:
     """
-    Führt einen kompletten Durchlauf aus:
-     - Discovery (DexScreener-Quellen) -> Core (AW_CFG) + Momentum-Pass (SOL, approx)
-     - Sanity-Filter für alle neuen Kandidaten
-     - Re-Eval: nicht abgelaufene Observe-Mints zusätzlich prüfen (auch wenn nicht in DS-Top-N)
-     - Klassifikation: observe vs. add vs. drop
-     - Add bis max_size
-     - Prune nach Inaktivität / Alter / TTL / Kappung
-    Rückgabe: {"added":[(mint,sym)], "observed":[(mint,sym)], "pruned":[(mint,reason)], "n": int}
+    Budgetierter Durchlauf:
+      – Quellen holen
+      – Kandidaten stark begrenzen
+      – Sanity mit Timeout
+      – Add/Observe/Prune
     """
     async with AW_LOCK:
         now = int(time.time())
@@ -1407,7 +1427,6 @@ async def aw_discover_once() -> dict:
         observed: list[tuple[str, str]] = []
         pruned: list[tuple[str, str]] = []
 
-        # 1) CORE-Discovery (gemäß AW_CFG)
         prefer_sol = (AW_CFG["quote"] == "sol")
         try:
             core_cands = await discover_candidates_ds_only(
@@ -1428,18 +1447,18 @@ async def aw_discover_once() -> dict:
         already = set(WATCHLIST)
         to_check: list[Candidate] = [c for c in core_cands if c.mint not in already]
 
-        # 2) Momentum-Pass (SOL, approx) -> ergänzt to_check
+        # Momentum-Pass (optional)
         mom_set: set[str] = set()
-        if AW_CFG.get("mom_enable"):
+        if AW_CFG.get("mom_enable", False):
             try:
                 mom_cands = await discover_candidates_ds_only(
-                    top_n=AW_CFG.get("mom_top", 20),
+                    top_n=AW_CFG.get("mom_top", 12),
                     max_age_min=AW_CFG.get("mom_max_age", 180),
                     min_lp_sol=AW_CFG.get("mom_min_lp", 0.3),
                     min_vol24_usd=AW_CFG.get("mom_min_vol", 300.0),
                     min_tx24=AW_CFG.get("mom_min_tx", 8),
-                    prefer_sol_quote=True,      # Momentum: SOL-Quote
-                    hotlist="approx",           # aktiviert m5-Filter (buys > sells)
+                    prefer_sol_quote=True,
+                    hotlist="approx",
                     pumpfun_only=False,
                     auto_relax=False,
                 )
@@ -1452,7 +1471,7 @@ async def aw_discover_once() -> dict:
                     to_check.append(mc)
                     mom_set.add(mc.mint)
 
-        # 3) Re-Eval der Observe-Liste (persist)
+        # Observe-Re-Eval (persist) – HART BEGRENZT, damit Sanity nicht explodiert
         obs_map = AW_STATE.setdefault("observed", {})
         ttl_sec = max(1, int(os.environ.get("AW_OBS_TTL_MIN", "30")) * 60)
 
@@ -1463,8 +1482,9 @@ async def aw_discover_once() -> dict:
                 obs_map.pop(m, None)
                 pruned.append((m, "observe_ttl"))
 
-        # Observe-Kandidaten zusätzlich prüfen
-        for m, meta in list(obs_map.items()):
+        # nur die ersten N Observe-Kandidaten zusätzlich prüfen
+        OBS_REEVAL_MAX = 20
+        for m, meta in list(obs_map.items())[:OBS_REEVAL_MAX]:
             if m in already or any(c.mint == m for c in to_check):
                 continue
             try:
@@ -1479,56 +1499,39 @@ async def aw_discover_once() -> dict:
             except Exception as ee:
                 logger.debug(f"[autowatch] observe re-eval skip {m}: {ee}")
 
-        # 4) Sanity für ALLE Kandidaten
+        # KANDIDATEN CAP – schützt die Sanity-Phase sicher vor Overrun
+        MAX_SANITY = max(10, AW_CFG.get("top", 15) + AW_CFG.get("mom_top", 12) + 10)
+        if len(to_check) > MAX_SANITY:
+            to_check = to_check[:MAX_SANITY]
+
+        # Sanity mit Timeout pro Token
         sanity: dict[str, dict] = await _aw_sanity_batch([c.mint for c in to_check]) if to_check else {}
 
-        # 5) Klassifikation
         def _classify(c: Candidate) -> str:
             rep    = sanity.get(c.mint) or {}
-            sscore = int(rep.get("score") or 0)          # Sanity-Score
+            sscore = int(rep.get("score") or 0)
             ok     = bool(rep.get("ok"))
-            qscore = int(c.score or 0)                   # DS-QScore
+            qscore = int(c.score or 0)
             m5_delta = int(getattr(c, "m5_buys", 0)) - int(getattr(c, "m5_sells", 0))
 
-            # ADD: robust & routbar
-            if ok and sscore >= AW_CFG["sscore_min_add"] and qscore >= AW_CFG["qscore_min_add"]:
+            if ok and sscore >= AW_CFG.get("sscore_min_add", 70) and qscore >= AW_CFG.get("qscore_min_add", 60):
                 return "add"
-
-            # OBSERVE
-            if sscore >= AW_CFG["sscore_min_observe"] and qscore >= AW_CFG["qscore_min_observe"]:
+            if sscore >= AW_CFG.get("sscore_min_observe", 60) and qscore >= AW_CFG.get("qscore_min_observe", 40):
                 return "observe"
-
-            # Momentum-Sonderfall
-            if (c.mint in mom_set) and (sscore >= AW_CFG["sscore_min_observe"] or m5_delta >= AW_CFG.get("mom_m5_min_delta", 3)):
+            if (c.mint in mom_set) and (sscore >= AW_CFG.get("sscore_min_observe", 60) or m5_delta >= AW_CFG.get("mom_m5_min_delta", 3)):
                 return "observe"
-
             return "drop"
 
         to_add: list[Candidate] = []
         for c in to_check:
             bucket = _classify(c)
-
             if bucket == "add":
-                # Liquidity-Gate vor ADD
-                if AW_ADD_REQUIRE_REFS > 0:
-                    try:
-                        refs = await _count_liquidity_refs_async(c.mint)
-                        total_refs = int(refs.get("total_liq_refs", 0))
-                        if total_refs < AW_ADD_REQUIRE_REFS:
-                            observed.append((c.mint, c.symbol))
-                            AW_STATE.setdefault("observed", {})[c.mint] = {"sym": c.symbol, "ts": now}
-                            continue
-                    except Exception:
-                        observed.append((c.mint, c.symbol))
-                        AW_STATE.setdefault("observed", {})[c.mint] = {"sym": c.symbol, "ts": now}
-                        continue
                 to_add.append(c)
-
             elif bucket == "observe":
                 observed.append((c.mint, c.symbol))
-                AW_STATE.setdefault("observed", {})[c.mint] = {"sym": c.symbol, "ts": now}
+                obs_map[c.mint] = {"sym": c.symbol, "ts": now}
 
-        # 6) Add in die Watchlist (kappen bei max_size)
+        # Add in Watchlist (cap)
         for c in to_add:
             if c.mint in WATCHLIST:
                 continue
@@ -1542,76 +1545,34 @@ async def aw_discover_once() -> dict:
                 "source": AW_CFG["hotlist"] or "search",
             }
             added.append((c.mint, c.symbol))
-            try:
-                obs_map.pop(c.mint, None)
-            except Exception:
-                pass
+            obs_map.pop(c.mint, None)
 
-        # 7) Prune (Inaktivität/Alter)
+        # Prune Inaktivität/Alter
         for m in list(WATCHLIST):
             active, delta, age_m = await _aw_check_activity_and_age(m)
-            st = AW_STATE["mints"].setdefault(m, {
-                "added_ts": now, "last_active_ts": now, "last_score": 0, "source": "unknown"
-            })
+            st = AW_STATE["mints"].setdefault(m, {"added_ts": now, "last_active_ts": now, "last_score": 0, "source": "unknown"})
             if active:
                 st["last_active_ts"] = now
-
-            # age-based prune
             if AW_CFG["prune_age_max_min"] > 0 and (age_m is not None) and (age_m > AW_CFG["prune_age_max_min"]):
-                WATCHLIST.remove(m)
-                AW_STATE["mints"].pop(m, None)
-                pruned.append((m, "age"))
-                # <<< FIX: State freigeben
-                if m not in OPEN_POS:
-                    _drop_mint_state(m)
-                continue
-
-            # inactivity prune
+                WATCHLIST.remove(m); AW_STATE["mints"].pop(m, None); pruned.append((m, "age")); continue
             if (now - int(st.get("last_active_ts") or now)) >= AW_CFG["prune_inactive_min"] * 60:
-                WATCHLIST.remove(m)
-                AW_STATE["mints"].pop(m, None)
-                pruned.append((m, "inactive"))
-                # <<< FIX: State freigeben
-                if m not in OPEN_POS:
-                    _drop_mint_state(m)
+                WATCHLIST.remove(m); AW_STATE["mints"].pop(m, None); pruned.append((m, "inactive"))
 
-        # 8) Kappung der Watchlist (nach Aktivität/Score)
+        # Kappung
         if len(WATCHLIST) > AW_CFG["max_size"]:
-            ordered = sorted(
-                WATCHLIST,
-                key=lambda x: ((AW_STATE["mints"].get(x, {}).get("last_active_ts") or 0),
-                               (AW_STATE["mints"].get(x, {}).get("last_score") or 0)),
-                reverse=True
-            )
+            ordered = sorted(WATCHLIST,
+                             key=lambda x: ((AW_STATE["mints"].get(x, {}).get("last_active_ts") or 0),
+                                            (AW_STATE["mints"].get(x, {}).get("last_score") or 0)),
+                             reverse=True)
             keep = set(ordered[:AW_CFG["max_size"]])
             for m in list(WATCHLIST):
                 if m not in keep:
                     WATCHLIST.remove(m)
                     AW_STATE["mints"].pop(m, None)
                     pruned.append((m, "cap"))
-                    # <<< FIX: State freigeben
-                    if m not in OPEN_POS:
-                        _drop_mint_state(m)
 
-        # 9) persist state & summary
         AW_STATE["last_run_ts"] = now
         _aw_save_state(AW_STATE)
-
-        # 10) Opportunistisches Aufräumen (Fallback, falls etwas durchgerutscht ist)
-        # <<< SWEEP
-        live = set(WATCHLIST) | set(OPEN_POS.keys())
-        for m in list(ENGINES.keys()):
-            if m not in live:
-                _drop_mint_state(m)
-
-        # 11) kleines Memory-Log
-        # <<< LOG
-        try:
-            logger.info("[aw] run: added=%d observed=%d pruned=%d | wl=%d | rss=%.1fMB",
-                        len(added), len(observed), len(pruned), len(WATCHLIST), _rss_mb())
-        except Exception:
-            pass
-
         return {"added": added, "observed": observed, "pruned": pruned, "n": len(core_cands)}
 
         
@@ -1619,29 +1580,26 @@ async def aw_discover_once() -> dict:
 
 async def aw_loop():
     """
-    Auto-Watchlist-Loop mit festem Takt und Hard-Timeout:
-      – führt aw_discover_once() mit Timeout aus
-      – postet die Run-Summary
-      – schläft intervallgenau: (interval_sec − Laufzeit)
+    Auto-Watchlist-Loop:
+      – aw_discover_once() mit Run-Timeout
+      – Telegram-Summary / Timeout-Hinweis
+      – intervallgenaues Sleep
     """
     while AW_CFG.get("enabled"):
         t0 = time.time()
         res = None
+        run_timeout = int(os.environ.get("AW_RUN_TIMEOUT_SEC", "60"))
+        interval    = int(AW_CFG.get("interval_sec", 60))
 
-        # Timeout/Intervall aus AW_CFG/ENV lesen (keine neuen Globals nötig)
-        run_timeout = int(AW_CFG.get("interval_sec") or os.environ.get("AW_RUN_TIMEOUT_SEC", "90"))
         try:
-            res = await asyncio.wait_for(aw_discover_once(), timeout=int(os.environ.get("AW_RUN_TIMEOUT_SEC", "90")))
+            res = await asyncio.wait_for(aw_discover_once(), timeout=run_timeout)
             if res:
                 a = ", ".join([f"{s}({m[:6]}…)" for m, s in res.get("added", [])]) or "-"
                 o = ", ".join([f"{s}({m[:6]}…)" for m, s in res.get("observed", [])]) or "-"
                 p = ", ".join([f"{m[:6]}…:{r}" for m, r in res.get("pruned", [])]) or "-"
 
-                # Persistente Observe-Anzeige (max 8 Items)
                 obs_persist_map = AW_STATE.get("observed", {}) or {}
-                obs_persist = ", ".join(
-                    [f"{v.get('sym','?')}({k[:6]}…)" for k, v in list(obs_persist_map.items())[:8]]
-                ) or "-"
+                obs_persist = ", ".join([f"{v.get('sym','?')}({k[:6]}…)" for k, v in list(obs_persist_map.items())[:8]]) or "-"
 
                 lines = [
                     "🤖 Auto-Watchlist (run)",
@@ -1665,9 +1623,7 @@ async def aw_loop():
         except Exception as e:
             logger.exception("[autowatch loop] %s", e)
 
-        # intervallgenau schlafen: Intervall − tatsächliche Laufzeit
         elapsed = time.time() - t0
-        interval = int(AW_CFG.get("interval_sec", 60))
         sleep_left = max(0.0, float(interval) - float(elapsed))
         while sleep_left > 0 and AW_CFG.get("enabled"):
             await asyncio.sleep(min(1.0, sleep_left))
@@ -1766,29 +1722,38 @@ async def _rpc_async(method: str, params: list, timeout: int) -> dict:
     return await asyncio.to_thread(_rpc, method, params, timeout)
 
 async def _recent_activity_60m(best_pair_addr: Optional[str]) -> dict:
+    """
+    Best-effort Aktivität: distinct signers & tx count der letzten ~60m.
+    Weniger RPC-Last: nur wenige getTransaction-Reads.
+    """
     out = {"tx_60m": 0, "uniq_signers_60m": 0}
     if not best_pair_addr:
         return out
     try:
         now = time.time()
-        sigs_obj = await _rpc_async("getSignaturesForAddress", [best_pair_addr, {"limit": 100}], SANITY_RPC_TIMEOUT)
+        sigs_obj = _rpc("getSignaturesForAddress", [best_pair_addr, {"limit": 100}])
         sigs = sigs_obj.get("result") or []
         recent = [s for s in sigs if (abs(int(s.get("blockTime") or now) - now) <= 3600)]
         out["tx_60m"] = len(recent)
+
+        # deutlich weniger Detail-Reads (war: 25)
         uniq = set()
-        for s in recent[:max(1, int(SANITY_MAX_TX_SAMPLES))]:
+        for s in recent[:8]:
             sig = s.get("signature")
-            if not sig: continue
-            tx = await _rpc_async("getTransaction", [sig, {"encoding": "json"}], SANITY_RPC_TIMEOUT)
-            msg = ((tx.get("result", {}) .get("transaction") or {}).get("message") or {})
+            if not sig:
+                continue
+            tx = _rpc("getTransaction", [sig, {"encoding": "json"}]).get("result") or {}
+            msg = ((tx.get("transaction") or {}).get("message") or {})
             accs = msg.get("accountKeys") or []
             if accs:
                 pk = accs[0].get("pubkey") if isinstance(accs[0], dict) else accs[0]
-                if pk: uniq.add(pk)
+                if pk:
+                    uniq.add(pk)
         out["uniq_signers_60m"] = len(uniq)
     except Exception:
         pass
     return out
+
 
 
 # ------------------------ Holder/Concentration --------------------------------
