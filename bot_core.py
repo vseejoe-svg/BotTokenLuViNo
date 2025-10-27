@@ -118,6 +118,10 @@ LAST_OHLCV_TS: Dict[str, int] = {}  # mint -> last_processed_time_ms
 # --- Liquidity-Gate für ADD (mind. X on-chain Refs) ---
 AW_ADD_REQUIRE_REFS = int(os.environ.get("AW_ADD_REQUIRE_REFS", "1"))
 
+# --- AutoWatch Timing ---
+AW_CFG["interval_sec"]    = int(os.environ.get("AW_INTERVAL_SEC",    AW_CFG.get("interval_sec", 60)))
+AW_CFG["run_timeout_sec"] = int(os.environ.get("AW_RUN_TIMEOUT_SEC", "90"))
+
 # Nur in Notebook/Colab sinnvoll. In Produktion mit uvicorn/uvloop NICHT patchen.
 try:
     import asyncio, nest_asyncio
@@ -1534,13 +1538,27 @@ async def aw_discover_once() -> dict:
 #=================================================================================================
 
 async def aw_loop():
-    while AW_CFG["enabled"]:
+    """
+    Auto-Watchlist-Loop mit festem Takt und Hard-Timeout:
+      - führt aw_discover_once() mit Timeout aus
+      - postet Run-Summary
+      - schläft genau (interval_sec - Laufzeit)
+    """
+    while AW_CFG.get("enabled"):
+        t0 = time.time()
+        res = None
+        # Timeout/Intervall mit sinnvollen Defaults, falls nicht in AW_CFG gesetzt
+        run_timeout = int(AW_CFG.get("run_timeout_sec", int(os.environ.get("AW_RUN_TIMEOUT_SEC", "90"))))
+        interval    = int(AW_CFG.get("interval_sec",    int(os.environ.get("AW_INTERVAL_SEC",    "60"))))
+
         try:
-            res = await aw_discover_once()
+            # Hard-Timeout pro Run verhindert Ausreißer (z.B. langsame RPC/HTTP)
+            res = await asyncio.wait_for(aw_discover_once(), timeout=run_timeout)
+
             if res:
-                a = ", ".join([f"{s}({m[:6]}…)" for m, s in res["added"]]) or "-"
+                a = ", ".join([f"{s}({m[:6]}…)" for m, s in res.get("added", [])]) or "-"
                 o = ", ".join([f"{s}({m[:6]}…)" for m, s in res.get("observed", [])]) or "-"
-                p = ", ".join([f"{m[:6]}…:{r}" for m, r in res["pruned"]]) or "-"
+                p = ", ".join([f"{m[:6]}…:{r}" for m, r in res.get("pruned", [])]) or "-"
 
                 # Persistente Observe-Anzeige (max 8 Items)
                 obs_persist_map = AW_STATE.get("observed", {}) or {}
@@ -1548,20 +1566,36 @@ async def aw_loop():
                     [f"{v.get('sym','?')}({k[:6]}…)" for k, v in list(obs_persist_map.items())[:8]]
                 ) or "-"
 
-                lines = ["🤖 Auto-Watchlist (run)",
-                         f"added: {a}",
-                         f"observe: {o}",
-                         f"observing(persist): {obs_persist}",
-                         f"pruned: {p}",
-                         *(_aw_cfg_snapshot_text())]
-                await tg_post("\n".join(lines))
+                lines = [
+                    "🤖 Auto-Watchlist (run)",
+                    f"added: {a}",
+                    f"observe: {o}",
+                    f"observing(persist): {obs_persist}",
+                    f"pruned: {p}",
+                    *(_aw_cfg_snapshot_text()),
+                ]
+                try:
+                    await tg_post("\n".join(lines))
+                except Exception:
+                    pass
+
+        except asyncio.TimeoutError:
+            logger.warning("[autowatch] discover timeout (>%ss)", run_timeout)
+            try:
+                await tg_post(f"⏱️ Auto-Watchlist: run timeout (> {run_timeout}s)")
+            except Exception:
+                pass
         except Exception as e:
             logger.exception(f"[autowatch loop] {e}")
-        # warte bis zum nächsten Intervall (hart beendet, wenn disabled)
-        for _ in range(AW_CFG["interval_sec"]):
-            if not AW_CFG["enabled"]:
-                break
-            await asyncio.sleep(1.0)
+
+        # Intervallgenau schlafen: Intervall minus tatsächliche Laufzeit
+        elapsed = time.time() - t0
+        sleep_left = max(0.0, float(interval) - float(elapsed))
+        # in kleinen Stücken schlafen, um /autowatch off sofort zu respektieren
+        while sleep_left > 0 and AW_CFG.get("enabled"):
+            await asyncio.sleep(min(1.0, sleep_left))
+            sleep_left -= 1.0
+
 
 # ======================= UNIFIED SANITY (extended) ============================
 # Erweitert dein Sanity um:
@@ -3379,7 +3413,7 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"Watchlist: {', '.join(WATCHLIST) or '-'}",
         "",
         "— <b>Core</b>",
-        "<code>/boot</code> / <code>/shutdown</code> – Bot an/aus",
+        "<code>/boot</code> / <code>/shutdown</code> – Bot an/aus, <code>/diag_webhook</code>",
         "<code>/status</code>, <code>/health</code>, <code>/diag</code>, <code>/set_proxy &lt;url|off&gt;</code>",
         "",
         "— <b>Trading</b>",
