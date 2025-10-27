@@ -119,8 +119,9 @@ LAST_OHLCV_TS: Dict[str, int] = {}  # mint -> last_processed_time_ms
 AW_ADD_REQUIRE_REFS = int(os.environ.get("AW_ADD_REQUIRE_REFS", "1"))
 
 # --- AutoWatch Timing ---
-AW_CFG["interval_sec"]    = int(os.environ.get("AW_INTERVAL_SEC",    AW_CFG.get("interval_sec", 60)))
-AW_CFG["run_timeout_sec"] = int(os.environ.get("AW_RUN_TIMEOUT_SEC", "90"))
+AW_ENABLED_DEFAULT = int(os.environ.get("AW_ENABLED_DEFAULT", "1"))
+AW_INTERVAL_SEC    = int(os.environ.get("AW_INTERVAL_SEC", "60"))
+AW_RUN_TIMEOUT_SEC = int(os.environ.get("AW_RUN_TIMEOUT_SEC", "90"))
 
 # Nur in Notebook/Colab sinnvoll. In Produktion mit uvicorn/uvloop NICHT patchen.
 try:
@@ -136,7 +137,6 @@ try:
         nest_asyncio.apply()
 except Exception:
     pass
-
 
 # =========================
 # Telegram Hilfsfunktionen
@@ -280,7 +280,7 @@ def render_mint_card(
         ex = []; ey = []
         for e in entries:
             if (e.get("type") or "").lower() == "entry":
-                ex.append(datetime.fromtimestamp(int(e["time"])/1000), dt.UTC)
+                ex.append(datetime.fromtimestamp(int(e["time"]) / 1000, dt.UTC))
                 ey.append(float(e["price"]))
         if ex:
             ax_p.scatter(ex, ey, marker="^", s=40, color="tab:green", zorder=6, label="Entry")
@@ -1209,8 +1209,9 @@ AW_SSCORE_MIN_OBS        = int(os.environ.get("AW_SSCORE_MIN_OBS", "60"))
 AW_OBS_TTL_MIN          = int(os.environ.get("AW_OBS_TTL_MIN", "30"))
 
 AW_CFG = {
-    "enabled": AW_ENABLED_DEFAULT,
-    "interval_sec": AW_INTERVAL_SEC,
+    "enabled":            AW_ENABLED_DEFAULT,   # 1/0 -> ON/OFF at boot
+    "interval_sec":       max(1,   AW_INTERVAL_SEC),
+    "run_timeout_sec":    max(5,   AW_RUN_TIMEOUT_SEC),
     "top": AW_TOP,
     "max_age": AW_MAX_AGE_MIN,
     "min_lp": AW_MIN_LP_SOL,
@@ -1226,10 +1227,10 @@ AW_CFG = {
     "max_size": max(1, AW_MAX_WATCHLIST),
     "m5_delta": max(0.0, AW_M5_DELTA),
     "sanity_conc": max(1, AW_SANITY_CONC),
-    "qscore_min_add":      max(0, min(100, AW_QSCORE_MIN_ADD)),
-    "qscore_min_observe":  max(0, min(100, AW_QSCORE_MIN_OBS)),
-    "sscore_min_add":      max(0, min(100, AW_SSCORE_MIN_ADD)),
-    "sscore_min_observe":  max(0, min(100, AW_SSCORE_MIN_OBS)),
+    "qscore_min_add":     max(0, min(100, int(os.environ.get("AW_QSCORE_MIN_ADD", "60")))),
+    "qscore_min_observe": max(0, min(100, int(os.environ.get("AW_QSCORE_MIN_OBS", "40")))),
+    "sscore_min_add":     max(0, min(100, int(os.environ.get("AW_SSCORE_MIN_ADD", "70")))),
+    "sscore_min_observe": max(0, min(100, int(os.environ.get("AW_SSCORE_MIN_OBS", "60")))),    
     "mom_enable":        (os.environ.get("AW_MOM_PASS_ENABLE","1").strip().lower() in ("1","true","yes","on")),
     "mom_top":           int(os.environ.get("AW_MOM_TOP","12")),
     "mom_max_age":       int(os.environ.get("AW_MOM_MAX_AGE","180")),
@@ -2727,12 +2728,20 @@ class SwingBotV163:
     def _pc(self, a: Optional[float], b: Optional[float]) -> Optional[float]:
         return None if (a is None or b is None or a == 0) else (b - a) / a * 100.0
 
-    def _hour_ok(self, epoch_ms: int) -> bool:
-        hour = int(dt.datetime.fromtimestamp(epoch_ms / 1000, UTC).hour)
+     def _hour_ok(self, epoch_ms: int) -> bool:
+        """
+        Whitelist der Stunden; allowed_hours_csv wird als *lokale* Stundenliste interpretiert.
+        Die Lokalzeit ergibt sich aus UTC + ALLOWED_HOURS_TZ_OFFSET_MIN (ENV, Minuten).
+        """
+        # UTC -> "lokal" mit Offset in Minuten verschieben
+        utc_dt   = dt.datetime.fromtimestamp(epoch_ms / 1000, UTC)
+        local_dt = utc_dt + dt.timedelta(minutes=ALLOWED_HOURS_TZ_OFFSET_MIN)
+        hour = int(local_dt.hour)
+
         allowed = {int(x.strip()) for x in self.cfg.allowed_hours_csv.split(",") if x.strip() != ""}
-        if not allowed:          # <- leer = kein Gate
+        if not allowed:   # leere Liste => Gate aus
             return True
-        return hour in allowed
+        return hour in allowed    
 
     def _highest_excl_current(self, arr: deque, lookback: int) -> Optional[float]:
         if len(arr) < lookback + 1: return None
@@ -5288,21 +5297,30 @@ async def cmd_autowatch(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await send(update, f"ℹ️ Auto‑Watchlist = {state}\n" + "\n".join(_aw_cfg_snapshot_text()))
     
 #===============================================================================
-
 async def cmd_aw_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not guard(update): return
-    st = AW_STATE
-    nwl = len(WATCHLIST)
-    last = st.get("last_run_ts") or 0
-    age = int(time.time()) - last if last>0 else None
+    if not guard(update):
+        return
+
+    # Quelle für "last run"
+    last = int(AW_STATE.get("last_run_ts") or 0)
+    nwl  = len(WATCHLIST)
+
+    if last > 0:
+        # Nutzt die oben definierte UTC-Konstante für Kompatibilität
+        last_str = dt.datetime.fromtimestamp(last, UTC).strftime('%Y-%m-%d %H:%M:%S') + "Z"
+        age_sec  = int(time.time()) - last
+        age_str  = f"{age_sec}s ago"
+    else:
+        last_str = "n/a"
+        age_str  = "n/a"
+
     lines = [
-        f"📊 Auto‑Watchlist Status: {'ON' if AW_CFG['enabled'] else 'OFF'}",
+        f"📊 Auto-Watchlist Status: {'ON' if AW_CFG.get('enabled') else 'OFF'}",
         f"watchlist size: {nwl}",
-        f"last run: {(''+str(dt.datetime.fromtimestamp(last))+'Z', dt.UTC) if last else 'n/a'} ({(str(age)+'s ago') if age is not None else 'n/a'})",
+        f"last run: {last_str} ({age_str})",
         *(_aw_cfg_snapshot_text()),
     ]
-    await send(update, "\n".join(lines))
-    
+    await send(update, "\n".join(lines))   
 #===============================================================================
 
 async def cmd_aw_now(update: Update, context: ContextTypes.DEFAULT_TYPE):
