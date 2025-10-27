@@ -123,6 +123,8 @@ AW_ENABLED_DEFAULT = int(os.environ.get("AW_ENABLED_DEFAULT", "1"))
 AW_INTERVAL_SEC    = int(os.environ.get("AW_INTERVAL_SEC", "60"))
 AW_RUN_TIMEOUT_SEC = int(os.environ.get("AW_RUN_TIMEOUT_SEC", "90"))
 
+ALLOWED_HOURS_TZ_OFFSET_MIN = int(os.environ.get("ALLOWED_HOURS_TZ_OFFSET_MIN", "60"))
+
 # Nur in Notebook/Colab sinnvoll. In Produktion mit uvicorn/uvloop NICHT patchen.
 try:
     import asyncio, nest_asyncio
