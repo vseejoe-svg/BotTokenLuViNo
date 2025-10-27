@@ -1622,17 +1622,19 @@ async def aw_loop():
     Auto-Watchlist-Loop mit festem Takt und Hard-Timeout:
       - führt aw_discover_once() mit Timeout aus
       - postet Run-Summary
-      - schläft genau (interval_sec - Laufzeit)
+      - schläft genau (interval_sec - Laufzeit) → kein Drift
+      - bricht NICHT bei Exceptions ab (außer Cancel für Shutdown)
     """
     while AW_CFG.get("enabled"):
-        t0 = time.time()
+        t_start = time.monotonic()
         res = None
-        # Timeout/Intervall mit sinnvollen Defaults, falls nicht in AW_CFG gesetzt
+
+        # robuste Defaults aus AW_CFG (wie gehabt)
         run_timeout = int(AW_CFG.get("run_timeout_sec", int(os.environ.get("AW_RUN_TIMEOUT_SEC", "90"))))
         interval    = int(AW_CFG.get("interval_sec",    int(os.environ.get("AW_INTERVAL_SEC",    "60"))))
 
         try:
-            # Hard-Timeout pro Run verhindert Ausreißer (z.B. langsame RPC/HTTP)
+            # pro Run strikt limitieren
             res = await asyncio.wait_for(aw_discover_once(), timeout=run_timeout)
 
             if res:
@@ -1659,6 +1661,9 @@ async def aw_loop():
                 except Exception:
                     pass
 
+        except asyncio.CancelledError:
+            # sauberes Shutdown-Verhalten
+            raise
         except asyncio.TimeoutError:
             logger.warning("[autowatch] discover timeout (>%ss)", run_timeout)
             try:
@@ -1666,15 +1671,19 @@ async def aw_loop():
             except Exception:
                 pass
         except Exception as e:
+            # WICHTIG: Loop lebt weiter
             logger.exception(f"[autowatch loop] {e}")
 
-        # Intervallgenau schlafen: Intervall minus tatsächliche Laufzeit
-        elapsed = time.time() - t0
+        # präzise Taktung
+        elapsed = time.monotonic() - t_start
         sleep_left = max(0.0, float(interval) - float(elapsed))
-        # in kleinen Stücken schlafen, um /autowatch off sofort zu respektieren
         while sleep_left > 0 and AW_CFG.get("enabled"):
-            await asyncio.sleep(min(1.0, sleep_left))
+            try:
+                await asyncio.sleep(min(1.0, sleep_left))
+            except asyncio.CancelledError:
+                raise
             sleep_left -= 1.0
+
 
 # ======================= UNIFIED SANITY (extended) ============================
 # Erweitert dein Sanity um:
@@ -2106,13 +2115,14 @@ def _get_wsol_usd() -> float:
 
 def gmgn_quote_price_usd(mint: str, wsol_in_sol: float = 0.01) -> float:
     """
-    Ermittelt den USD‑Preis des Tokens über eine kleine WSOL→Token Route.
-    Nutzt den WSOL/USD‑Preis zur Umrechnung.
+    Ermittelt den USD-Preis des Tokens über eine kleine WSOL→Token Route.
+    Nutzt den WSOL/USD-Preis zur Umrechnung.
     """
     try:
+        # WICHTIG: gmgn_get_route_safe hat KEIN anti_mev-Argument in der Signatur
         data = gmgn_get_route_safe(
             WSOL_MINT, mint, lamports(wsol_in_sol),
-            WALLET_PUBKEY, GMGN_SLIPPAGE_PCT, GMGN_FEE_SOL, True
+            WALLET_PUBKEY, GMGN_SLIPPAGE_PCT, GMGN_FEE_SOL
         )
         q = (data.get("quote") or {})
         out_amt = float(q.get("outAmount") or 0.0)
@@ -2130,6 +2140,7 @@ def gmgn_quote_price_usd(mint: str, wsol_in_sol: float = 0.01) -> float:
         return usd_in / token_qty if token_qty > 0 else 0.0
     except Exception:
         return 0.0
+
 
 #=================================================================================================
 
@@ -5556,28 +5567,37 @@ async def cmd_aw_config(update: Update, context: ContextTypes.DEFAULT_TYPE):
 #===============================================================================
 
 async def cmd_autowatch(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    global AUTO_DISC_TASK
-    if not guard(update): return
+    # EIN Task-Holder für Autowatch: AUTOWATCH_TASK
+    global AUTOWATCH_TASK
+    if not guard(update): 
+        return
+
     arg = (context.args[0].strip().lower() if context.args else "")
+
     if arg in ("on","start","1","true"):
-        if AW_CFG["enabled"] and AUTO_DISC_TASK and not AUTO_DISC_TASK.done():
-            return await send(update, "ℹ️ Auto‑Watchlist: läuft bereits.")
+        if AW_CFG["enabled"] and AUTOWATCH_TASK and not AUTOWATCH_TASK.done():
+            return await send(update, "ℹ️ Auto-Watchlist: läuft bereits.")
         AW_CFG["enabled"] = True
-        AUTO_DISC_TASK = asyncio.create_task(aw_loop())
-        return await send(update, "✅ Auto‑Watchlist: gestartet.")
+        AUTOWATCH_TASK = asyncio.create_task(aw_loop())
+        return await send(update, "✅ Auto-Watchlist: gestartet.")
+
     if arg in ("off","stop","0","false"):
         AW_CFG["enabled"] = False
         try:
-            if AUTO_DISC_TASK and not AUTO_DISC_TASK.done():
-                AUTO_DISC_TASK.cancel()
-                try: await AUTO_DISC_TASK
-                except asyncio.CancelledError: pass
+            if AUTOWATCH_TASK and not AUTOWATCH_TASK.done():
+                AUTOWATCH_TASK.cancel()
+                try:
+                    await AUTOWATCH_TASK
+                except asyncio.CancelledError:
+                    pass
         finally:
-            AUTO_DISC_TASK = None
-        return await send(update, "🛑 Auto‑Watchlist: gestoppt.")
-    # status
-    state = "ON" if AW_CFG["enabled"] else "OFF"
-    await send(update, f"ℹ️ Auto‑Watchlist = {state}\n" + "\n".join(_aw_cfg_snapshot_text()))
+            AUTOWATCH_TASK = None
+        return await send(update, "🛑 Auto-Watchlist: gestoppt.")
+
+    # Status
+    state = "ON" if AW_CFG.get("enabled") else "OFF"
+    await send(update, f"ℹ️ Auto-Watchlist = {state}\n" + "\n".join(_aw_cfg_snapshot_text()))
+
     
 #===============================================================================
 async def cmd_aw_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
