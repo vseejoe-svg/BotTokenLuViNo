@@ -1620,23 +1620,18 @@ async def aw_discover_once() -> dict:
 async def aw_loop():
     """
     Auto-Watchlist-Loop mit festem Takt und Hard-Timeout:
-      - führt aw_discover_once() mit Timeout aus
-      - postet Run-Summary
-      - schläft genau (interval_sec - Laufzeit) → kein Drift
-      - bricht NICHT bei Exceptions ab (außer Cancel für Shutdown)
+      – führt aw_discover_once() mit Timeout aus
+      – postet die Run-Summary
+      – schläft intervallgenau: (interval_sec − Laufzeit)
     """
     while AW_CFG.get("enabled"):
-        t_start = time.monotonic()
+        t0 = time.time()
         res = None
 
-        # robuste Defaults aus AW_CFG (wie gehabt)
-        run_timeout = int(AW_CFG.get("run_timeout_sec", int(os.environ.get("AW_RUN_TIMEOUT_SEC", "90"))))
-        interval    = int(AW_CFG.get("interval_sec",    int(os.environ.get("AW_INTERVAL_SEC",    "60"))))
-
+        # Timeout/Intervall aus AW_CFG/ENV lesen (keine neuen Globals nötig)
+        run_timeout = int(AW_CFG.get("interval_sec") or os.environ.get("AW_RUN_TIMEOUT_SEC", "90"))
         try:
-            # pro Run strikt limitieren
-            res = await asyncio.wait_for(aw_discover_once(), timeout=run_timeout)
-
+            res = await asyncio.wait_for(aw_discover_once(), timeout=int(os.environ.get("AW_RUN_TIMEOUT_SEC", "90")))
             if res:
                 a = ", ".join([f"{s}({m[:6]}…)" for m, s in res.get("added", [])]) or "-"
                 o = ", ".join([f"{s}({m[:6]}…)" for m, s in res.get("observed", [])]) or "-"
@@ -1661,29 +1656,22 @@ async def aw_loop():
                 except Exception:
                     pass
 
-        except asyncio.CancelledError:
-            # sauberes Shutdown-Verhalten
-            raise
         except asyncio.TimeoutError:
-            logger.warning("[autowatch] discover timeout (>%ss)", run_timeout)
+            logger.warning("autobot:[autowatch] discover timeout (> %ss)", run_timeout)
             try:
                 await tg_post(f"⏱️ Auto-Watchlist: run timeout (> {run_timeout}s)")
             except Exception:
                 pass
         except Exception as e:
-            # WICHTIG: Loop lebt weiter
-            logger.exception(f"[autowatch loop] {e}")
+            logger.exception("[autowatch loop] %s", e)
 
-        # präzise Taktung
-        elapsed = time.monotonic() - t_start
+        # intervallgenau schlafen: Intervall − tatsächliche Laufzeit
+        elapsed = time.time() - t0
+        interval = int(AW_CFG.get("interval_sec", 60))
         sleep_left = max(0.0, float(interval) - float(elapsed))
         while sleep_left > 0 and AW_CFG.get("enabled"):
-            try:
-                await asyncio.sleep(min(1.0, sleep_left))
-            except asyncio.CancelledError:
-                raise
+            await asyncio.sleep(min(1.0, sleep_left))
             sleep_left -= 1.0
-
 
 # ======================= UNIFIED SANITY (extended) ============================
 # Erweitert dein Sanity um:
@@ -1863,7 +1851,7 @@ async def sanity_check_token(
     min_tx24: int     = 50,
     min_age_min: int  = 3,
 ) -> dict:
-    # --- NEU: Mint normalisieren (URL/Strings → erstes Base58-Match 32..44) ---
+    # --- Mint normalisieren (URL/String → erstes Base58-Match 32..44) ---
     if not _looks_like_solana_addr(mint):
         m = _SOLANA_ADDR_RE.search(mint or "")
         if m:
@@ -1871,7 +1859,7 @@ async def sanity_check_token(
 
     rep: Dict[str, Any] = {"mint": mint, "ok": True, "issues": [], "score": 100, "metrics": {}}
 
-    # a) DS Basics (robustes Parsing: dict["pairs"] ODER direktes Array)
+    # a) DexScreener Basics (robustes Parsing: dict["pairs"] ODER direktes Array)
     js = _ds_get_json(f"https://api.dexscreener.com/token-pairs/v1/solana/{mint}", timeout=10)
     pairs = []
     if isinstance(js, list):
@@ -1881,7 +1869,7 @@ async def sanity_check_token(
     if not pairs:
         rep["ok"] = False; rep["issues"].append("no_ds_pair"); rep["score"] -= 40; return rep
 
-    # bestes Solana-Paar nach USD-LP wählen
+    # bestes Solana-Pair nach USD-LP wählen
     sol_pairs = [p for p in pairs if (p.get("chainId") or "").lower()=="solana"]
     cand = sol_pairs if sol_pairs else pairs
     def _liq_usd(p):
@@ -1899,37 +1887,37 @@ async def sanity_check_token(
 
     rep["metrics"].update({"lp_sol": lp_sol, "vol24": vol24, "tx24": tx24, "age_min": age_min})
 
-    # harte Gates (unverändert)
+    # harte Gates
     if lp_sol < min_liq_sol: rep["ok"]=False; rep["issues"].append("low_liquidity"); rep["score"]-=20
     if vol24 < min_vol24:    rep["issues"].append("low_vol24");     rep["score"]-=10
     if tx24  < min_tx24:     rep["issues"].append("low_tx24");      rep["score"]-=10
     if (age_min is not None) and (age_min < min_age_min): rep["issues"].append("very_new"); rep["score"]-=10
 
-    # b) Route-Check (KO nur wSOL) — async + bounded timeout - wSOL → mint
+    # b) Route-Checks (KO nur wSOL) – asynchron + hart begrenzt
     try:
         await asyncio.wait_for(
             gmgn_get_route_async(
                 WSOL_MINT, mint, lamports(0.01),
                 WALLET_PUBKEY, GMGN_SLIPPAGE_PCT, GMGN_FEE_SOL, True
             ),
-            timeout=GMGN_HTTP_TIMEOUT + 1
+            timeout=20
         )
     except Exception:
         rep["issues"].append("route_wsol_fail"); rep["score"] -= 15; rep["ok"] = False
 
-    # USDC → mint (nur wenn nicht geskippt)
-    if not SANITY_SKIP_USDC_ROUTE:
+    # USDC→mint optional (per ENV SANITY_SKIP_USDC_ROUTE=1 ausblendbar)
+    if not (os.environ.get("SANITY_SKIP_USDC_ROUTE", "0").strip().lower() in ("1","true","on","yes")):
         try:
             await asyncio.wait_for(
                 gmgn_get_route_async(
                     USDC_MINT, mint, 1_000_000,
                     WALLET_PUBKEY, GMGN_SLIPPAGE_PCT, GMGN_FEE_SOL, True
                 ),
-                timeout=GMGN_HTTP_TIMEOUT + 1
+                timeout=20
             )
         except Exception:
             rep["issues"].append("route_usdc_fail"); rep["score"] -= 8
-            
+
     # c) Liquidity-Refs
     liq_refs = await _count_liquidity_refs_async(mint)
     rep["metrics"].update(liq_refs)
@@ -1957,8 +1945,8 @@ async def sanity_check_token(
     else:
         rep["issues"].append("no_mint_info"); rep["score"] -= 5
 
-    # f) Holder-Konzentration + Burn-Anteil (Moralis optional)
-    share = _moralis_top_share(mint, limit=10) if SANITY_ENABLE_MORALIS else None
+    # f) Holder-Konzentration + Burn-Anteil
+    share = _moralis_top_share(mint, limit=10)
     largest = []
     if share is None:
         try:
@@ -1966,25 +1954,22 @@ async def sanity_check_token(
             top10 = sum(float(a.get("uiAmount") or 0.0) for a in largest[:10])
             ts = await asyncio.to_thread(client.get_token_supply, Pubkey.from_string(mint))
             try:
-                supply_total = int(ts.value.amount) / (10 ** int(ts.value.decimals))
+                supply_total = int(ts.value.amount)/(10**int(ts.value.decimals))
             except Exception:
                 dec = await get_mint_decimals_async(mint)
-                supply_total = float(getattr(ts.value, "ui_amount_string", 0.0)) or (int(ts.value.amount) / (10 ** dec))
-            share = (top10 / supply_total) if supply_total > 0 else None
+                supply_total = float(getattr(ts.value,"ui_amount_string",0.0)) or (int(ts.value.amount)/(10**dec))
+            share = (top10/supply_total) if supply_total>0 else None
         except Exception:
             share = None
-
     if share is not None:
         rep["metrics"]["top10_share"] = share
-        if share >= 0.90: rep["issues"].append("top10_concentration_very_high"); rep["score"] -= 15; rep["ok"] = False
-        elif share >= 0.80: rep["issues"].append("top10_concentration_high"); rep["score"] -= 8
+        if share >= 0.90: rep["issues"].append("top10_concentration_very_high"); rep["score"] -= 15; rep["ok"]=False
+        elif share >= 0.80: rep["issues"].append("top10_concentration_high");   rep["score"] -= 8
         elif share >= 0.70: rep["issues"].append("top10_concentration_elevated"); rep["score"] -= 4
 
     if not largest:
-        try:
-            largest = rpc_get_token_largest_accounts(mint, top_n=10)
-        except Exception:
-            largest = []
+        try: largest = rpc_get_token_largest_accounts(mint, top_n=10)
+        except Exception: largest = []
     burn_share = _burn_share_from_list(largest) if largest else 0.0
     rep["metrics"]["burn_share_top10"] = burn_share
     if burn_share >= 0.05: rep["score"] += 2
@@ -1997,6 +1982,7 @@ async def sanity_check_token(
 
     rep["score"] = max(0, min(100, int(rep["score"])))
     return rep
+
 
 # ===================== END UNIFIED SANITY (extended) ==========================
 # =========================
@@ -5774,24 +5760,14 @@ async def cmd_boot(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not guard(update):
         return
     msgs = []
-
-    # 1) Haupt-Strategie-Loop (deine vorhandene auto_loop)
+    # 1) Haupt-Strategie-Loop
     msgs.append(await _start_bg_task("AutoLoop", "AUTO_TASK", auto_loop, APP))
-
-    # 2) Auto-Watch (nur wenn vorhanden)
-    autowatch = globals().get("autowatch_loop", None)
-   # msgs.append(await _start_bg_task("AutoWatch", "AUTOWATCH_TASK", autowatch, APP))
+    # 2) Auto-Watchlist (korrekter Funktionsname!)
     msgs.append(await _start_bg_task("AutoWatch", "AUTOWATCH_TASK", aw_loop))
-
-
-    # 3) Auto-Liquidity (nur wenn vorhanden)
-   # autoliq = globals().get("auto_liquidity_loop", None)
-    #msgs.append(await _start_bg_task("AutoLiquidity", "AUTO_LIQ_TASK", autoliq, APP))
-    # 3) Auto-Liquidity (falls Routine vorhanden)
+    # 3) Auto-Liquidity (korrekter Funktionsname!)
     msgs.append(await _start_bg_task("AutoLiquidity", "AUTO_LIQ_TASK", auto_liq_loop))
-
-
     await send(update, "\n".join(msgs))
+
 
 
 async def cmd_shutdown(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -6123,18 +6099,22 @@ async def _apply_signals(app: Application, mint: str, bar: dict, signals: list[d
             try:
                 # BUY
                 res = await buy_wsol_to_token(mint, DEFAULT_NOTIONAL_SOL, bar["close"])
-                # --- NEU: SL/TPs für die Meldung berechnen ---
+                # --- NEU: SL/TPs für die Meldung berechnen ---                
                 eng = ENGINES.get(mint)
                 if eng:
-                    st = eng.st; cfg = eng.cfg
+                    st  = eng.st; cfg = eng.cfg
                     entry = float(bar["close"])
-                    atr   = float(eng.last_diag.get("atr") or 0.0)  # zuletzt berechneter ATR auf diesem Bar
-                    # falls du absolut sicher gehen willst, nimm st.sl_abs nach dem Entry:
+                    atr   = float(eng.last_diag.get("atr") or 0.0)
+                    atr_pc = float(eng.last_diag.get("atr_pc") or ((atr/entry)*100.0 if entry else 0.0))
                     sl_abs = entry - atr * cfg.risk_atr
                     R      = entry - sl_abs
                     tp1_px = entry + cfg.tp1_rr * R
                     tp2_px = entry + cfg.tp2_rr * R
-                    extra  = f"\nSL≈{sl_abs:.6f}  TP1≈{tp1_px:.6f}  TP2≈{tp2_px:.6f}  (ATR≈{atr:.6f})"
+                    extra  = (
+                        f"\nSL≈{sl_abs:.6f}  TP1≈{tp1_px:.6f}  TP2≈{tp2_px:.6f}  "
+                        f"(ATR≈{atr:.6f} / {atr_pc:.2f}%)"
+                    )                
+
                 else:
                     extra = ""
                 await app.bot.send_message(
