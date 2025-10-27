@@ -1219,7 +1219,7 @@ AW_STATE_PATH = "autowatch_state.json"
 
 AW_ENABLED_DEFAULT      = int(os.getenv("AW_ENABLED_DEFAULT", 1))
 AW_INTERVAL_SEC         = int(os.getenv("AW_INTERVAL_SEC", 60))
-AW_TOP                  = int(os.getenv("AW_TOP", 5))
+AW_TOP                  = int(os.getenv("AW_TOP", 12))
 AW_MAX_AGE_MIN          = int(os.getenv("AW_MAX_AGE_MIN", 0))
 AW_MIN_LP_SOL           = float(os.getenv("AW_MIN_LP_SOL", 0))
 AW_MIN_VOL24_USD        = float(os.getenv("AW_MIN_VOL24_USD", 0))
@@ -3921,53 +3921,89 @@ async def cmd_trending(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 #===============================================================================
 # --- RAW: DS search helper mit Alias-Normalisierung
-async def cmd_dsraw(update, context):
-    if not guard(update): 
+async def cmd_dsraw(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not guard(update):
         return
 
-    # 1) Query aus Args, sonst sinnvolle Default-Kaskade (ohne 'chain:solana')
-    user_q = None
-    if context.args:
-        user_q = " ".join(context.args).strip()
+    # 1) Query aus Args, sonst eine kleine Default-Kaskade (ohne 'chain:solana')
+    user_q = " ".join(context.args).strip() if context.args else None
+    queries = [user_q] if user_q else ["quoteToken:SOL", "raydium", "sol usdc", "pumpfun"]
 
-    queries = [user_q] if user_q else [
-        "quoteToken:SOL",
-        "raydium",
-        "sol usdc",
-        "pumpfun",
-    ]
+    def _fmt_usd(x: float) -> str:
+        try:
+            return f"${int(float(x)):,}"
+        except Exception:
+            try:
+                return f"${float(x):,.2f}"
+            except Exception:
+                return "$0"
 
-    lines = []
-    total = 0
-    found = 0
+    async def _search(q: str) -> list[dict]:
+        js = await _get_json(_wrap(f"{DS_BASE}/search?q={quote_plus(q)}"))
+        pairs = (js or {}).get("pairs") or []
+        return [p for p in pairs if (p.get("chainId") or "").lower() == "solana"]
 
+    # Telegram texts können 4096 Zeichen – wir schicken in Seiten
+    PAGE_SIZE = 12  # wie viele Paare pro Nachricht
     for q in queries:
         if not q:
             continue
-        js = await _get_json(_wrap(f"{DS_BASE}/search?q={quote_plus(q)}"))
-        pairs = (js or {}).get("pairs") or []
 
-        # NUR Solana-Paare anzeigen
-        sol_pairs = [p for p in pairs if (p.get("chainId") or "").lower() == "solana"]
-        total += len(pairs)
-        found += len(sol_pairs)
+        try:
+            pairs = await _search(q)
+        except Exception as e:
+            await send(update, f"dsraw:\n🔎 q='{q}' → Fehler: {e}")
+            continue
 
-        if sol_pairs:
-            lines.append(f"🔎 q='{q}' → {len(sol_pairs)} Solana-Paare")
-            for p in sol_pairs[:5]:
+        header = f"dsraw:\n🔎 q='{q}' → {len(pairs)} Solana-Paare"
+        if not pairs:
+            await update.effective_chat.send_message(header, parse_mode=ParseMode.HTML)
+            continue
+
+        # Seitenweise ausgeben
+        for i in range(0, len(pairs), PAGE_SIZE):
+            chunk = pairs[i:i + PAGE_SIZE]
+            lines = [header] if i == 0 else [f"(weiter q='{q}')"]
+
+            for p in chunk:
                 base = (p.get("baseToken") or {})
-                sym  = base.get("symbol") or "?"
-                liq  = float(((p.get("liquidity") or {}).get("usd") or 0))
-                vol  = float(((p.get("volume") or {}).get("h24") or 0))
-                txh  = (p.get("txns") or {}).get("h24") or {}
-                buys = _safe_int(txh.get("buys")); sells=_safe_int(txh.get("sells"))
-                lines.append(f"  - {sym} | liq≈${int(liq):,} | vol24≈${int(vol):,} | tx24={buys+sells}")
-        else:
-            lines.append(f"🔎 q='{q}' → 0 Solana-Paare")
+                sym  = (base.get("symbol") or "").strip()
+                name = (base.get("name") or "").strip()
+                display = sym or name or "?"
+                mint = (base.get("address") or "").strip()
 
-    if not lines:
-        return await send(update, "(dsraw) keine Paare gefunden (alle Fallbacks).")
-    await send(update, "dsraw:\n" + "\n".join(lines) + f"\n\nSumme: {found}/{total} (nur Solana gezählt)")
+                # Link: bevorzugt DS-URL; sonst pairAddress; sonst Mint
+                pair_addr = (p.get("pairAddress") or "").strip()
+                url = (p.get("url") or
+                       (f"https://dexscreener.com/solana/{pair_addr}" if pair_addr else
+                        f"https://dexscreener.com/solana/{mint}"))
+
+                liq_usd = float(((p.get("liquidity") or {}).get("usd") or 0.0))
+                vol24   = float(((p.get("volume") or {}).get("h24") or 0.0))
+                txh     = (p.get("txns") or {}).get("h24") or {}
+                tx24    = int(txh.get("buys") or 0) + int(txh.get("sells") or 0)
+
+                open_tag = ""
+                if mint in OPEN_POS:
+                    pos = OPEN_POS[mint]
+                    try:
+                        open_tag = f" • <b>OPEN</b> qty={pos.qty:.6f} @ {pos.entry_price:.6f}"
+                    except Exception:
+                        open_tag = " • <b>OPEN</b>"
+
+                # Zeile mit anklickbarem Namen
+                lines.append(
+                    f"- <a href='{url}'>{display}</a> | "
+                    f"liq≈{_fmt_usd(liq_usd)} | vol24≈{_fmt_usd(vol24)} | tx24={tx24}"
+                    f"{open_tag}"
+                )
+
+            await update.effective_chat.send_message(
+                "\n".join(lines),
+                parse_mode=ParseMode.HTML,
+                disable_web_page_preview=True,
+            )
+
 
 #===============================================================================
 # ---- Telegram Command: /ds_trending --------------------------------------
@@ -5005,15 +5041,121 @@ async def cmd_positions(update: Update, context: ContextTypes.DEFAULT_TYPE):
 #===============================================================================
 
 async def cmd_open_trades(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not guard(update): return
-    if not OPEN_POS: return await send(update, "Keine offenen Positionen.")
-    lines = ["📊 Open Trades:"]
-    for m, pos in OPEN_POS.items():
-        lines.append(f"- {m[:6]}… qty={pos.qty:.6f} | entry={pos.entry_price:.6f}")
-    await send(update, "\n".join(lines))
-#===============================================================================
+    """
+    Open Trades mit PnL, Name-Link (DexScreener) sowie SL, TP1, TP2.
+    """
+    if not guard(update):
+        return
 
-# --- PATCH: in cmd_buy (statt BE→GMGN hart) ---
+    if not OPEN_POS:
+        return await send(update, "Keine offenen Positionen.")
+
+    def _fmt_usd(x: float) -> str:
+        try:
+            return f"{float(x):+,.2f} USD"
+        except Exception:
+            return "+0.00 USD"
+
+    def _fmt_pct(x: float) -> str:
+        try:
+            return f"{float(x):+,.2f}%"
+        except Exception:
+            return "+0.00%"
+
+    def _fmt_px(x: float | None) -> str:
+        return f"{float(x):.6f}" if (x is not None and x == x) else "-"
+
+    # 1) Preise möglichst in einem Rutsch holen (Birdeye Multi), dann Fallback pro Mint.
+    open_mints = list(OPEN_POS.keys())
+    px_map: Dict[str, float] = {}
+    try:
+        px_map = birdeye_price_multi(open_mints) or {}
+    except Exception:
+        px_map = {}
+
+    # Fallback für fehlende Einträge
+    for m in open_mints:
+        if float(px_map.get(m) or 0.0) <= 0.0:
+            try:
+                px_map[m] = get_price_usd(m)
+            except Exception:
+                px_map[m] = 0.0
+
+    # 2) Ausgabe bauen
+    lines: List[str] = []
+    lines.append(f"📊 <b>Open Trades</b>  (n={len(open_mints)})")
+
+    for mint in open_mints:
+        pos = OPEN_POS.get(mint)
+        if not pos:
+            continue
+
+        # DexScreener-Name + Link
+        try:
+            name, _age = dexscreener_token_meta(mint)
+        except Exception:
+            name = mint[:6] + "…"
+        url = f"https://dexscreener.com/solana/{mint}"
+
+        entry = float(getattr(pos, "entry_price", 0.0) or 0.0)
+        qty   = float(getattr(pos, "qty", 0.0) or 0.0)
+        last  = float(px_map.get(mint, 0.0) or 0.0)
+
+        pnl_usd = (last - entry) * qty if (last > 0 and entry > 0 and qty > 0) else 0.0
+        pnl_pct = ((last - entry) / entry * 100.0) if entry > 0 else 0.0
+
+        # SL / TP1 / TP2 berechnen
+        sl_txt = "-"
+        tp1_txt = "-"
+        tp2_txt = "-"
+
+        eng = ENGINES.get(mint)
+        if eng:
+            st = eng.st
+            cfg = eng.cfg
+
+            # aktueller SL falls vorhanden
+            if getattr(st, "sl_abs", None) is not None:
+                sl_txt = _fmt_px(st.sl_abs)
+            else:
+                sl_txt = "-"
+
+            # R-Basis: 1) aus Entry & SL (wenn SL<Entry), sonst 2) aus ATR*Risk, sonst keine TPs
+            R = None
+            try:
+                if st.entry_price is not None and st.sl_abs is not None and st.sl_abs < st.entry_price:
+                    R = float(st.entry_price) - float(st.sl_abs)
+                else:
+                    atr_now = float(eng.last_diag.get("atr") or 0.0)
+                    if st.entry_price is not None and atr_now > 0:
+                        R = atr_now * float(cfg.risk_atr)
+            except Exception:
+                R = None
+
+            if R and st.entry_price:
+                try:
+                    tp1_px = float(st.entry_price) + float(cfg.tp1_rr) * R
+                    tp2_px = float(st.entry_price) + float(cfg.tp2_rr) * R
+                    tp1_txt = _fmt_px(tp1_px)
+                    tp2_txt = _fmt_px(tp2_px)
+                except Exception:
+                    pass
+
+        # Zeile ausgeben (HTML, klickbarer Name)
+        lines.append(
+            f"• <a href='{url}'>{name}</a> ({mint[:6]}…)"
+            f"\n   qty={qty:,.6f} | entry={_fmt_px(entry)} | last={_fmt_px(last)}"
+            f"\n   PnL: {_fmt_usd(pnl_usd)}  ({_fmt_pct(pnl_pct)})"
+            f"\n   SL={sl_txt}  |  TP1={tp1_txt}  |  TP2={tp2_txt}"
+        )
+
+    await update.effective_chat.send_message(
+        "\n".join(lines),
+        parse_mode=ParseMode.HTML,
+        disable_web_page_preview=True,
+    )
+
+#===============================================================================
 async def cmd_buy(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not guard(update): return
     if not context.args: return await send(update, "/buy <MINT> [sol_notional]")
@@ -5857,6 +5999,14 @@ async def auto_loop(app: Application):
                             )
                         )
                         _last_debug_ts[mint] = time.time()
+            
+            if time.time() - last_sweep > SWEEP_EVERY:
+                live = set(WATCHLIST) | set(OPEN_POS.keys())
+                for m in list(ENGINES.keys()):
+                    if m not in live:
+                        _drop_mint_state(m)
+                last_sweep = time.time()
+                
             await asyncio.sleep(1.0)
 
         except Exception as e:
