@@ -135,6 +135,7 @@ SANITY_SKIP_USDC_ROUTE = os.getenv("SANITY_SKIP_USDC_ROUTE", "1").lower() in ("1
 SANITY_RPC_TIMEOUT     = int(os.getenv("SANITY_RPC_TIMEOUT",   "8"))  # vorher 15
 SANITY_MAX_TX_SAMPLES  = int(os.getenv("SANITY_MAX_TX_SAMPLES", "6")) # vorher 25
 GMGN_HTTP_TIMEOUT = int(os.getenv("GMGN_HTTP_TIMEOUT", "20"))
+SANITY_GMGN_TIMEOUT = GMGN_HTTP_TIMEOUT
 
 # Nur in Notebook/Colab sinnvoll. In Produktion mit uvicorn/uvloop NICHT patchen.
 try:
@@ -1897,20 +1898,27 @@ async def sanity_check_token(
     if tx24  < min_tx24:     rep["issues"].append("low_tx24");      rep["score"]-=10
     if (age_min is not None) and (age_min < min_age_min): rep["issues"].append("very_new"); rep["score"]-=10
 
-    # b) Route-Check (KO nur wSOL) — async + bounded timeout
+    # b) Route-Check (KO nur wSOL) — async + bounded timeout - wSOL → mint
     try:
         await asyncio.wait_for(
-            gmgn_get_route_async(WSOL_MINT, mint, lamports(0.01), WALLET_PUBKEY, GMGN_SLIPPAGE_PCT, GMGN_FEE_SOL, True, SANITY_GMGN_TIMEOUT),
-            timeout=SANITY_GMGN_TIMEOUT + 1
+            gmgn_get_route_async(
+                WSOL_MINT, mint, lamports(0.01),
+                WALLET_PUBKEY, GMGN_SLIPPAGE_PCT, GMGN_FEE_SOL, True
+            ),
+            timeout=GMGN_HTTP_TIMEOUT + 1
         )
     except Exception:
         rep["issues"].append("route_wsol_fail"); rep["score"] -= 15; rep["ok"] = False
 
+    # USDC → mint (nur wenn nicht geskippt)
     if not SANITY_SKIP_USDC_ROUTE:
         try:
             await asyncio.wait_for(
-                gmgn_get_route_async(USDC_MINT, mint, 1_000_000, WALLET_PUBKEY, GMGN_SLIPPAGE_PCT, GMGN_FEE_SOL, True, SANITY_GMGN_TIMEOUT),
-                timeout=SANITY_GMGN_TIMEOUT + 1
+                gmgn_get_route_async(
+                    USDC_MINT, mint, 1_000_000,
+                    WALLET_PUBKEY, GMGN_SLIPPAGE_PCT, GMGN_FEE_SOL, True
+                ),
+                timeout=GMGN_HTTP_TIMEOUT + 1
             )
         except Exception:
             rep["issues"].append("route_usdc_fail"); rep["score"] -= 8
@@ -2034,96 +2042,37 @@ def gmgn_get_route(token_in: str, token_out: str, in_amount: int,
     url = "https://gmgn.ai/defi/router/v1/sol/tx/get_swap_route"
     hdr = {"accept": "application/json"}
 
-    # Param-Superset (mit Aliases), damit kleine API-Änderungen abgefedert werden.
-    # Nicht alle Keys werden zwingend vom Server verwendet.
     params = {
-        # Token-IDs
         "inTokenAddress": token_in,
         "outTokenAddress": token_out,
-        "tokenIn": token_in,            # Alias
-        "tokenOut": token_out,          # Alias
-
-        # Menge/Absender
+        "tokenIn": token_in,
+        "tokenOut": token_out,
         "amount": str(in_amount),
-        "inAmount": str(in_amount),     # Alias
+        "inAmount": str(in_amount),
         "from": from_addr,
-        "userPublicKey": from_addr,     # Alias
-
-        # Slippage
+        "userPublicKey": from_addr,
         "slippage": float(slippage_pct),
-        "slippageBps": int(round(slippage_pct * 100)),  # Alias (Basispunkte)
-
-        # Gebühren/MEV
+        "slippageBps": int(round(slippage_pct * 100)),
         "fee": float(fee_sol),
-        "platformFee": float(fee_sol),  # Alias
-
-        # Anti-MEV-Schalter
+        "platformFee": float(fee_sol),
         "antiMEV": "true" if anti_mev else "false",
-        "antiMev": "true" if anti_mev else "false",     # Alias
+        "antiMev": "true" if anti_mev else "false",
     }
 
-    r = http_get(url, params=params, headers=hdr, timeout=SANITY_GMGN_TIMEOUT)
+    r = http_get(url, params=params, headers=hdr, timeout=GMGN_HTTP_TIMEOUT)
     ct = (r.headers.get("content-type") or "").lower()
     if "application/json" not in ct:
         raise RuntimeError(f"GMGN non-json ct={ct}")
 
     j = r.json() or {}
-    # Häufiges Schema: {"code":0, "data": {...}}
     if j.get("code") == 0 and "data" in j:
         return j["data"]
-    # Manchmal ohne "code"
     if "data" in j:
         return j["data"]
-    # Fallback: Payload direkt auf Top-Level
     if "raw_tx" in j or "quote" in j:
         return j
 
     raise RuntimeError(f"GMGN route error: {j}")
-
-
-def gmgn_get_route_safe(token_in:str, token_out:str, in_amount:int,
-                        from_addr:str, slippage_pct:float, fee_sol:float)->dict:
-    try:
-        return gmgn_get_route(token_in, token_out, in_amount, from_addr, slippage_pct, fee_sol, True)
-    except Exception as e1:
-        # Fallback ohne Anti-MEV
-        return gmgn_get_route(token_in, token_out, in_amount, from_addr, slippage_pct, fee_sol, False)
-
-def gmgn_send_signed(base64_tx:str)->dict:
-    url="https://gmgn.ai/txproxy/v1/send_transaction"
-    return http_post(url, json_body={"chain":"sol","signedTx":base64_tx}, timeout=20).json()
-
-def _get_wsol_usd() -> float:
-    # 1) Birdeye
-    be, _ = birdeye_price_detailed(WSOL_MINT)
-    if be>0: return be
-    # 2) GMGN Route wSOL->USDC
-    try:
-        d = gmgn_get_route_safe(WSOL_MINT, USDC_MINT, int(0.01*1_000_000_000), WALLET_PUBKEY, GMGN_SLIPPAGE_PCT, GMGN_FEE_SOL)
-        out = float((d.get("quote") or {}).get("outAmount") or 0.0)/1_000_000.0
-        if out>0: return out/0.01
-    except Exception:
-        pass
-    # 3) DexScreener
-    ds = dexscreener_price_usd(WSOL_MINT)
-    return ds if ds>0 else 0.0
-
-def gmgn_quote_price_usd(mint: str) -> float:
-    try:
-        wsol_usd = _get_wsol_usd()
-        if wsol_usd <= 0: return 0.0
-        data = gmgn_get_route_safe(WSOL_MINT, mint, int(0.05*1_000_000_000),
-                                   WALLET_PUBKEY, GMGN_SLIPPAGE_PCT, GMGN_FEE_SOL)
-        q = (data.get("quote") or {})
-        out_amt = float(q.get("outAmount") or 0.0)
-        dec = int(q.get("outDecimals") or q.get("outDecimal") or _DECIMALS_CACHE.get(mint) or 9)
-        dec = max(0, min(18, dec))
-        if out_amt <= 0: return 0.0
-        token_qty = out_amt / (10 ** dec)
-        usd_in = 0.05 * wsol_usd
-        return usd_in / token_qty if token_qty > 0 else 0.0
-    except Exception:
-        return 0.0
 
 def gmgn_quote_price_usd_v2(mint: str) -> float:
     try:
