@@ -1766,48 +1766,31 @@ async def _count_liquidity_refs_async(mint: str) -> dict:
     return {"raydium_refs": ray, "orca_refs": orc, "meteora_refs": met, "total_liq_refs": ray+orc+met}
 
 # ----------------------- Activity (60m) – best effort ------------------------
+async def _rpc_async(method: str, params: list, timeout: int) -> dict:
+    return await asyncio.to_thread(_rpc, method, params, timeout)
+
 async def _recent_activity_60m(best_pair_addr: Optional[str]) -> dict:
-    """
-    Best-effort Aktivität: distinct signers & tx count der letzten ~60m.
-    Gekappt über ENV:
-      - SANITY_RPC_TIMEOUT (pro RPC Call)
-      - SANITY_MAX_TX_SAMPLES (getTransaction-Stichproben)
-    Außerdem harte Laufzeitbremse (≈ 2 * SANITY_RPC_TIMEOUT).
-    """
     out = {"tx_60m": 0, "uniq_signers_60m": 0}
     if not best_pair_addr:
         return out
-
-    t0 = time.time()
-    budget = SANITY_RPC_TIMEOUT * 2  # Gesamtbudget für diese Routine
-
     try:
-        # 1) Signatures (max 100), gefiltert auf ~60m
-        sigs = _rpc("getSignaturesForAddress",
-                    [best_pair_addr, {"limit": 100}],
-                    timeout=SANITY_RPC_TIMEOUT).get("result") or []
         now = time.time()
+        sigs_obj = await _rpc_async("getSignaturesForAddress", [best_pair_addr, {"limit": 100}], SANITY_RPC_TIMEOUT)
+        sigs = sigs_obj.get("result") or []
         recent = [s for s in sigs if (abs(int(s.get("blockTime") or now) - now) <= 3600)]
         out["tx_60m"] = len(recent)
-
-        # 2) nur wenige Transaktionen lesen (gedrosselt)
         uniq = set()
-        for s in recent[:max(0, SANITY_MAX_TX_SAMPLES)]:
-            if time.time() - t0 > budget:
-                break
+        for s in recent[:max(1, int(SANITY_MAX_TX_SAMPLES))]:
             sig = s.get("signature")
-            if not sig:
-                continue
-            tx = _rpc("getTransaction", [sig, {"encoding": "json"}], timeout=SANITY_RPC_TIMEOUT).get("result") or {}
-            msg = ((tx.get("transaction") or {}).get("message") or {})
+            if not sig: continue
+            tx = await _rpc_async("getTransaction", [sig, {"encoding": "json"}], SANITY_RPC_TIMEOUT)
+            msg = ((tx.get("result", {}) .get("transaction") or {}).get("message") or {})
             accs = msg.get("accountKeys") or []
             if accs:
-                a0 = accs[0]
-                uniq.add(a0.get("pubkey") if isinstance(a0, dict) else a0)
-
+                pk = accs[0].get("pubkey") if isinstance(accs[0], dict) else accs[0]
+                if pk: uniq.add(pk)
         out["uniq_signers_60m"] = len(uniq)
     except Exception:
-        # best effort → still ok
         pass
     return out
 
@@ -1914,18 +1897,24 @@ async def sanity_check_token(
     if tx24  < min_tx24:     rep["issues"].append("low_tx24");      rep["score"]-=10
     if (age_min is not None) and (age_min < min_age_min): rep["issues"].append("very_new"); rep["score"]-=10
 
-    # b) Route-Check (KO nur wSOL)
+    # b) Route-Check (KO nur wSOL) — async + bounded timeout
     try:
-        _ = gmgn_get_route_safe(WSOL_MINT, mint, lamports(0.01), WALLET_PUBKEY, GMGN_SLIPPAGE_PCT, GMGN_FEE_SOL)
+        await asyncio.wait_for(
+            gmgn_get_route_async(WSOL_MINT, mint, lamports(0.01), WALLET_PUBKEY, GMGN_SLIPPAGE_PCT, GMGN_FEE_SOL, True, SANITY_GMGN_TIMEOUT),
+            timeout=SANITY_GMGN_TIMEOUT + 1
+        )
     except Exception:
         rep["issues"].append("route_wsol_fail"); rep["score"] -= 15; rep["ok"] = False
 
     if not SANITY_SKIP_USDC_ROUTE:
         try:
-            _ = gmgn_get_route_safe(USDC_MINT, mint, 1_000_000, WALLET_PUBKEY, GMGN_SLIPPAGE_PCT, GMGN_FEE_SOL)
+            await asyncio.wait_for(
+                gmgn_get_route_async(USDC_MINT, mint, 1_000_000, WALLET_PUBKEY, GMGN_SLIPPAGE_PCT, GMGN_FEE_SOL, True, SANITY_GMGN_TIMEOUT),
+                timeout=SANITY_GMGN_TIMEOUT + 1
+            )
         except Exception:
             rep["issues"].append("route_usdc_fail"); rep["score"] -= 8
-
+            
     # c) Liquidity-Refs
     liq_refs = await _count_liquidity_refs_async(mint)
     rep["metrics"].update(liq_refs)
@@ -2032,7 +2021,6 @@ async def cmd_check_liqui(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await send(update, f"❌ Fehler bei Liquidity-Check: {e}")
 # ------------------------------------------------------------------------------
 # --- GMGN Preis-Fallbacks ---
-# --- GMGN Preis-Fallbacks ---
 def gmgn_get_route(token_in: str, token_out: str, in_amount: int,
                    from_addr: str, slippage_pct: float, fee_sol: float,
                    anti_mev: bool = True) -> dict:
@@ -2069,12 +2057,12 @@ def gmgn_get_route(token_in: str, token_out: str, in_amount: int,
         "fee": float(fee_sol),
         "platformFee": float(fee_sol),  # Alias
 
-        # Anti‑MEV-Schalter
+        # Anti-MEV-Schalter
         "antiMEV": "true" if anti_mev else "false",
         "antiMev": "true" if anti_mev else "false",     # Alias
     }
 
-    r = http_get(url, params=params, headers=hdr, timeout=GMGN_HTTP_TIMEOUT)
+    r = http_get(url, params=params, headers=hdr, timeout=SANITY_GMGN_TIMEOUT)
     ct = (r.headers.get("content-type") or "").lower()
     if "application/json" not in ct:
         raise RuntimeError(f"GMGN non-json ct={ct}")
