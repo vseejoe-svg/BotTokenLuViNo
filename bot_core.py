@@ -4669,12 +4669,11 @@ async def on_cb_remove_watch(update: Update, context: ContextTypes.DEFAULT_TYPE)
 
 async def cmd_list_watch(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """
-    Zeigt die Watchlist (nach DS-Volumen 24h absteigend), mit:
-      - Name (DexScreener-Link)
-      - OPEN-Status (falls Position existiert)
+    Zeigt die Watchlist (nach 24h-Volumen absteigend) mit:
+      - Name als anklickbaren DexScreener-Link
       - Alter (Pair-Erstellungszeit)
-      - Market Cap (FDV)
-      - Volumen 24h
+      - FDV (mcap) und 24h-Volumen
+      - OPEN-Status (qty @ entry) falls Position existiert
     """
     if not guard(update):
         return
@@ -4682,7 +4681,7 @@ async def cmd_list_watch(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not WATCHLIST:
         return await send(update, "👀 Watchlist: -")
 
-    # kleine Formatter
+    # Formatter
     def _fmt_usd(x: float) -> str:
         try:
             return f"${int(x):,}"
@@ -4699,7 +4698,7 @@ async def cmd_list_watch(update: Update, context: ContextTypes.DEFAULT_TYPE):
         except Exception:
             return "n/a"
 
-    # pro Mint DS-Daten holen (konkurrenzbegrenzt)
+    # DS-Daten pro Mint (konkurrenzbegrenzt) holen
     sem = asyncio.Semaphore(6)
 
     async def _fetch_row(mint: str) -> Tuple[str, str, str, float, float]:
@@ -4707,11 +4706,14 @@ async def cmd_list_watch(update: Update, context: ContextTypes.DEFAULT_TYPE):
         Rückgabe: (mint, html_name_link, age_txt, mcap_usd, vol24_usd)
         """
         async with sem:
-            name = mint[:6] + "…"
+            # Defaults
+            default_name = mint[:6] + "…"
+            name = default_name
             url = f"https://dexscreener.com/solana/{mint}"
             age_txt = "n/a"
             mcap_usd = 0.0
             vol24_usd = 0.0
+
             try:
                 js = _ds_get_json(f"https://api.dexscreener.com/tokens/v1/solana/{mint}", timeout=10)
                 pairs = js.get("pairs") if isinstance(js, dict) else []
@@ -4719,9 +4721,8 @@ async def cmd_list_watch(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 if best:
                     base = (best.get("baseToken") or {})
                     sym  = (base.get("symbol") or "").strip()
-                    n2   = (base.get("name")   or "").strip()
-                    disp = sym or n2 or name
-                    name = disp
+                    nm   = (base.get("name")   or "").strip()
+                    name = sym or nm or name
                     url  = best.get("url") or url
                     age_txt = _age_from_pair(best)
                     try:
@@ -4732,35 +4733,32 @@ async def cmd_list_watch(update: Update, context: ContextTypes.DEFAULT_TYPE):
                         mcap_usd = float(best.get("fdv") or 0.0)
                     except Exception:
                         mcap_usd = 0.0
-                else:
-                    # Fallback: nur Name & Alter ermitteln
-                    nm, ag = dexscreener_token_meta(mint)
-                    if nm: name = nm
-                    if ag: age_txt = ag
             except Exception:
-                # Fallback ohne Buttons/HTML
+                # keine Netzwerkausgabe/Send hier – nur Fallbacks
+                pass
+
+            # Zusätzlicher Fallback nur für Name/Alter
+            if name == default_name or age_txt == "n/a":
                 try:
-                    plain_name, _ = dexscreener_token_meta(mint)
-                    await send(
-                        update,
-                        f"{plain_name} ({mint[:6]}…)\n"
-                        f" age={age_txt}  mcap≈{_fmt_usd(mcap_usd)}  vol24≈{_fmt_usd(vol24_usd)}{open_txt}\n"
-                        f"https://dexscreener.com/solana/{mint}"
-                    )
+                    nm2, ag2 = dexscreener_token_meta(mint)
+                    if name == default_name and nm2:
+                        name = nm2
+                    if age_txt == "n/a" and ag2:
+                        age_txt = ag2
                 except Exception:
                     pass
 
             html_link = f"<a href='{url}'>{name}</a>"
             return (mint, html_link, age_txt, mcap_usd, vol24_usd)
 
-    # Daten konkurrent holen
+    # Daten holen
     tasks = [asyncio.create_task(_fetch_row(m)) for m in WATCHLIST]
     results = await asyncio.gather(*tasks, return_exceptions=False)
 
-    # nach Volumen 24h absteigend sortieren
+    # Sortierung: Volumen 24h absteigend
     results.sort(key=lambda r: (r[4] or 0.0), reverse=True)
 
-    # Übersichtskopf (einmalig)
+    # Kopfzeile
     try:
         await update.effective_chat.send_message(
             "👀 Watchlist (nach 24h-Volumen absteigend):",
@@ -4769,13 +4767,16 @@ async def cmd_list_watch(update: Update, context: ContextTypes.DEFAULT_TYPE):
     except Exception:
         pass
 
-    # Ausgabe pro Token mit Buttons
+    # Ausgabe pro Token + Buttons
     for (mint, html_name_link, age_txt, mcap_usd, vol24_usd) in results:
         # OPEN-Status
         pos = OPEN_POS.get(mint)
         open_txt = ""
-        if pos and pos.qty > 0:
-            open_txt = f" • <b>OPEN</b> qty={pos.qty:.6f} @ {pos.entry_price:.6f}"
+        if pos and getattr(pos, "qty", 0.0) > 0:
+            try:
+                open_txt = f" • <b>OPEN</b> qty={pos.qty:.6f} @ {pos.entry_price:.6f}"
+            except Exception:
+                open_txt = " • <b>OPEN</b>"
 
         text = (
             f"- {html_name_link} ({mint[:6]}…)\n"
@@ -4788,13 +4789,23 @@ async def cmd_list_watch(update: Update, context: ContextTypes.DEFAULT_TYPE):
         ])
 
         try:
-            await update.effective_chat.send_message(text, reply_markup=kb, parse_mode=ParseMode.HTML, disable_web_page_preview=True)
+            await update.effective_chat.send_message(
+                text,
+                reply_markup=kb,
+                parse_mode=ParseMode.HTML,
+                disable_web_page_preview=True
+            )
         except Exception:
-            # Fallback ohne Buttons/HTML
+            # letzte, minimalistische Fallback-Ausgabe
             try:
-                await send(update, f"{name} ({mint[:6]}…)\n age={age_txt}  mcap≈{_fmt_usd(mcap_usd)}  vol24≈{_fmt_usd(vol24_usd)}{open_txt}\nhttps://dexscreener.com/solana/{mint}")
+                await send(
+                    update,
+                    f"{mint[:6]}…\n age={age_txt}  mcap≈{_fmt_usd(mcap_usd)}  vol24≈{_fmt_usd(vol24_usd)}{open_txt}\n"
+                    f"https://dexscreener.com/solana/{mint}"
+                )
             except Exception:
                 pass
+
 
 #===============================================================================
 
