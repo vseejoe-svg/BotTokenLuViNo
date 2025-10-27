@@ -611,7 +611,6 @@ async def _get_json(url: str, timeout: int = 10) -> Optional[dict]:
     except Exception:
         return None
 
-
 def _ds_pick_best_sol_pair(pairs: list[dict]) -> dict | None:
     """Wähle das liquideste Solana-Paar; wenn keines markiert, nimm bestes nach USD-Liq."""
     if not pairs:
@@ -1677,7 +1676,6 @@ async def aw_loop():
             await asyncio.sleep(min(1.0, sleep_left))
             sleep_left -= 1.0
 
-
 # ======================= UNIFIED SANITY (extended) ============================
 # Erweitert dein Sanity um:
 #  (1) Liquidity-Layer: Raydium/Orca/Meteora Referenzen via getProgramAccounts
@@ -2074,6 +2072,8 @@ def gmgn_get_route(token_in: str, token_out: str, in_amount: int,
 
     raise RuntimeError(f"GMGN route error: {j}")
 
+#=================================================================================================
+
 def gmgn_get_route_safe(token_in: str, token_out: str, in_amount: int,
                         from_addr: str, slippage_pct: float, fee_sol: float) -> dict:
     try:
@@ -2081,6 +2081,8 @@ def gmgn_get_route_safe(token_in: str, token_out: str, in_amount: int,
     except Exception:
         # Fallback ohne Anti-MEV
         return gmgn_get_route(token_in, token_out, in_amount, from_addr, slippage_pct, fee_sol, False)
+
+#=================================================================================================
 
 def _get_wsol_usd() -> float:
     # 1) Birdeye
@@ -2100,24 +2102,36 @@ def _get_wsol_usd() -> float:
     ds = dexscreener_price_usd(WSOL_MINT)
     return ds if ds > 0 else 0.0
 
-def gmgn_quote_price_usd(mint: str) -> float:
+#=================================================================================================
+
+def gmgn_quote_price_usd(mint: str, wsol_in_sol: float = 0.01) -> float:
+    """
+    Ermittelt den USD‑Preis des Tokens über eine kleine WSOL→Token Route.
+    Nutzt den WSOL/USD‑Preis zur Umrechnung.
+    """
     try:
+        data = gmgn_get_route_safe(
+            WSOL_MINT, mint, lamports(wsol_in_sol),
+            WALLET_PUBKEY, GMGN_SLIPPAGE_PCT, GMGN_FEE_SOL, True
+        )
+        q = (data.get("quote") or {})
+        out_amt = float(q.get("outAmount") or 0.0)
+        out_dec = int(q.get("outDecimals") or q.get("outDecimal") or _DECIMALS_CACHE.get(mint) or 9)
+        out_dec = max(0, min(18, out_dec))
+        if out_amt <= 0:
+            return 0.0
+        token_qty = out_amt / (10 ** out_dec)
+        if token_qty <= 0:
+            return 0.0
         wsol_usd = _get_wsol_usd()
         if wsol_usd <= 0:
             return 0.0
-        data = gmgn_get_route_safe(WSOL_MINT, mint, int(0.05 * 1_000_000_000),
-                                   WALLET_PUBKEY, GMGN_SLIPPAGE_PCT, GMGN_FEE_SOL)
-        q = (data.get("quote") or {})
-        out_amt = float(q.get("outAmount") or 0.0)
-        dec = int(q.get("outDecimals") or q.get("outDecimal") or _DECIMALS_CACHE.get(mint) or 9)
-        dec = max(0, min(18, dec))
-        if out_amt <= 0:
-            return 0.0
-        token_qty = out_amt / (10 ** dec)
-        usd_in = 0.05 * wsol_usd
+        usd_in = wsol_in_sol * wsol_usd
         return usd_in / token_qty if token_qty > 0 else 0.0
     except Exception:
         return 0.0
+
+#=================================================================================================
 
 def gmgn_quote_price_usd_v2(mint: str) -> float:
     try:
@@ -2131,6 +2145,9 @@ def gmgn_quote_price_usd_v2(mint: str) -> float:
         return 1.0 / token_qty if token_qty > 0 else 0.0
     except Exception:
         return 0.0
+        
+#=================================================================================================
+
 def get_price_usd_src(mint: str) -> Tuple[float, str, str]:
     try:
         px, reason = birdeye_price_detailed(mint)
@@ -2189,7 +2206,7 @@ async def get_mint_decimals_async(mint: str) -> int:
 def get_token_balance(owner:str, mint:str)->float: return rpc_get_spl_balance(owner, mint)
 def lamports(sol: float)->int: return int(round(sol*1_000_000_000))
 
-# =========================
+#=================================================================================================
 # GMGN Routing/Exec (TX)
 # =========================
 def rpc_send_signed_b64(signed_b64: str) -> dict:
@@ -2252,7 +2269,8 @@ async def wait_for_confirmation(signature: str, timeout_sec: float = 60.0) -> st
             pass
     return "timeout"
 
-# =========================
+
+#=================================================================================================
 # Positions- & PnL-Helpers
 # =========================
 class Position:
@@ -2276,9 +2294,7 @@ def total_unreal_pnl() -> tuple[float, list[str]]:
             rows.append(f"- {m[:6]}… qty={pos.qty:.4f} | Preis n/a")
     return unreal, rows
 
-
-
-# =========================
+#=================================================================================================
 # Execution Helpers (BUY/SELL)
 # =========================
 async def rpc_send_signed_b64_async(signed_b64: str) -> dict:
@@ -2303,13 +2319,13 @@ async def refresh_qty_from_chain_async(mint: str) -> float:
 # ======= PAPER MODE (ENV-gesteuert) =======
 # PAPER_MODE=1         -> Papiersimulation EIN
 # PAPER_FEE_BPS=20     -> simulierte Fee in Basispunkten (0.20 %)
-#PAPER_MODE = os.environ.get("PAPER_MODE", "0").strip().lower() in ("1", "true", "yes", "on")
-#PAPER_FEE_BPS = float(os.environ.get("PAPER_FEE_BPS", "20"))  # 20 bps = 0.20 %
+# PAPER_MODE = os.environ.get("PAPER_MODE", "0").strip().lower() in ("1", "true", "yes", "on")
+# PAPER_FEE_BPS = float(os.environ.get("PAPER_FEE_BPS", "20"))  # 20 bps = 0.20 %
 
 def _paper_sig() -> str:
     return f"paper-{int(time.time()*1000)}"
 
-# --- Robuste Preisbeschaffung für Executions (mit Retries + Hint) ---
+#--- Robuste Preisbeschaffung für Executions (mit Retries + Hint) ---
 def _try_sources_for_price(mint: str) -> float:
     """
     Versucht mehrere Quellen in sinnvoller Reihenfolge.
@@ -2366,6 +2382,8 @@ def get_price_for_execution(mint: str, *, mkt_price_hint: float | None = None,
     raise RuntimeError("Kein gültiger Preis für Execution erhalten (alle Quellen 0).")
 
 
+#=================================================================================================
+
 async def _paper_buy_wsol_to_token(mint: str, notional_sol: float, mkt_price_usd: float) -> dict:
     """
     Paper-Buy: SOL-Notional → Token-Menge; Fee in BPS wird abgezogen.
@@ -2401,6 +2419,7 @@ async def _paper_buy_wsol_to_token(mint: str, notional_sol: float, mkt_price_usd
     )
     return {"sig": sig, "status": "ok", "qty": qty_net}
 
+#=================================================================================================
 
 async def _paper_sell_partial(mint: str, fraction: float, mkt_price_hint: float | None = None) -> dict:
     """
@@ -2432,6 +2451,8 @@ async def _paper_sell_partial(mint: str, fraction: float, mkt_price_hint: float 
     )
     return {"sig": sig, "status": "ok", "res": {"paper": True}, "realized_usd": realized}
 
+#=================================================================================================
+
 async def _paper_sell_all(mint: str, mkt_price_hint: float | None = None) -> dict:
     """
     Paper-Vollverkauf: robust über get_price_for_execution().
@@ -2460,6 +2481,7 @@ async def _paper_sell_all(mint: str, mkt_price_hint: float | None = None) -> dic
     )
     return {"sig": sig, "status": "ok", "res": {"paper": True}, "realized_usd": realized}
 
+#=================================================================================================
 
 async def buy_wsol_to_token(mint: str, notional_sol: float, mkt_price_usd: float) -> dict:
     if PAPER_MODE:
@@ -2480,6 +2502,8 @@ async def buy_wsol_to_token(mint: str, notional_sol: float, mkt_price_usd: float
         note=f"notional={notional_sol} SOL"
     )
     return {"sig": sig, "status": status, "qty": qty}
+
+#=================================================================================================
 
 async def sell_partial(mint: str, fraction: float) -> dict:
     if PAPER_MODE:
@@ -2510,6 +2534,8 @@ async def sell_partial(mint: str, fraction: float) -> dict:
     )
     return {"sig": sig, "status": status, "res": send_res, "realized_usd": realized}
 
+#=================================================================================================
+
 async def sell_all(mint: str) -> dict:
     if PAPER_MODE:
         return await _paper_sell_all(mint)
@@ -2538,6 +2564,8 @@ async def sell_all(mint: str) -> dict:
         entry_px=pos.entry_price if pos else None, exit_px=sell_px, realized_usd=realized, note=""
     )
     return {"sig": sig, "status": status, "res": send_res, "realized_usd": realized}
+
+#=================================================================================================
 
 async def cmd_pnl(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not guard(update):
@@ -2628,7 +2656,8 @@ async def cmd_pnl(update: Update, context: ContextTypes.DEFAULT_TYPE):
         except Exception:
             pass
 
-# =========================
+
+#=================================================================================================
 # Strategy v1.6.3 (leicht erweitert mit Diag)
 # =========================
 def sma(series: deque, length: int) -> Optional[float]:
@@ -5736,8 +5765,11 @@ async def cmd_boot(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
     # 3) Auto-Liquidity (nur wenn vorhanden)
-    autoliq = globals().get("auto_liquidity_loop", None)
-    msgs.append(await _start_bg_task("AutoLiquidity", "AUTO_LIQ_TASK", autoliq, APP))
+   # autoliq = globals().get("auto_liquidity_loop", None)
+    #msgs.append(await _start_bg_task("AutoLiquidity", "AUTO_LIQ_TASK", autoliq, APP))
+    # 3) Auto-Liquidity (falls Routine vorhanden)
+    msgs.append(await _start_bg_task("AutoLiquidity", "AUTO_LIQ_TASK", auto_liq_loop))
+
 
     await send(update, "\n".join(msgs))
 
