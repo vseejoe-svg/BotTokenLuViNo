@@ -2728,7 +2728,7 @@ class SwingBotV163:
     def _pc(self, a: Optional[float], b: Optional[float]) -> Optional[float]:
         return None if (a is None or b is None or a == 0) else (b - a) / a * 100.0
 
-     def _hour_ok(self, epoch_ms: int) -> bool:
+    def _hour_ok(self, epoch_ms: int) -> bool:
         """
         Whitelist der Stunden; allowed_hours_csv wird als *lokale* Stundenliste interpretiert.
         Die Lokalzeit ergibt sich aus UTC + ALLOWED_HOURS_TZ_OFFSET_MIN (ENV, Minuten).
