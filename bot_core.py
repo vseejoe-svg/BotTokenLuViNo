@@ -415,7 +415,7 @@ def _retry_policy_for(url: str, method: str = "GET") -> tuple[int, float, float,
 
 def http_get(url: str, params=None, headers=None, timeout=15):
     global CB_FAILS, CB_OPEN_UNTIL
-    max_retry, base_delay, jitter_max, cb_sensitive = _تق_retry_policy_for(url, "GET") if False else _retry_policy_for(url, "GET")  # guard for copy/paste
+    max_retry, base_delay, jitter_max, cb_sensitive = _retry_policy_for(url, "GET") if False else _retry_policy_for(url, "GET")  # guard for copy/paste
     # CircuitBreaker nur anwenden, wenn sensitives Ziel
     if cb_sensitive and time.time() < CB_OPEN_UNTIL:
         raise RuntimeError("CircuitBreaker aktiv")
@@ -2073,6 +2073,51 @@ def gmgn_get_route(token_in: str, token_out: str, in_amount: int,
         return j
 
     raise RuntimeError(f"GMGN route error: {j}")
+
+def gmgn_get_route_safe(token_in: str, token_out: str, in_amount: int,
+                        from_addr: str, slippage_pct: float, fee_sol: float) -> dict:
+    try:
+        return gmgn_get_route(token_in, token_out, in_amount, from_addr, slippage_pct, fee_sol, True)
+    except Exception:
+        # Fallback ohne Anti-MEV
+        return gmgn_get_route(token_in, token_out, in_amount, from_addr, slippage_pct, fee_sol, False)
+
+def _get_wsol_usd() -> float:
+    # 1) Birdeye
+    be, _ = birdeye_price_detailed(WSOL_MINT)
+    if be > 0:
+        return be
+    # 2) GMGN Route wSOL -> USDC
+    try:
+        d = gmgn_get_route_safe(WSOL_MINT, USDC_MINT, int(0.01 * 1_000_000_000),
+                                WALLET_PUBKEY, GMGN_SLIPPAGE_PCT, GMGN_FEE_SOL)
+        out = float((d.get("quote") or {}).get("outAmount") or 0.0) / 1_000_000.0
+        if out > 0:
+            return out / 0.01
+    except Exception:
+        pass
+    # 3) DexScreener
+    ds = dexscreener_price_usd(WSOL_MINT)
+    return ds if ds > 0 else 0.0
+
+def gmgn_quote_price_usd(mint: str) -> float:
+    try:
+        wsol_usd = _get_wsol_usd()
+        if wsol_usd <= 0:
+            return 0.0
+        data = gmgn_get_route_safe(WSOL_MINT, mint, int(0.05 * 1_000_000_000),
+                                   WALLET_PUBKEY, GMGN_SLIPPAGE_PCT, GMGN_FEE_SOL)
+        q = (data.get("quote") or {})
+        out_amt = float(q.get("outAmount") or 0.0)
+        dec = int(q.get("outDecimals") or q.get("outDecimal") or _DECIMALS_CACHE.get(mint) or 9)
+        dec = max(0, min(18, dec))
+        if out_amt <= 0:
+            return 0.0
+        token_qty = out_amt / (10 ** dec)
+        usd_in = 0.05 * wsol_usd
+        return usd_in / token_qty if token_qty > 0 else 0.0
+    except Exception:
+        return 0.0
 
 def gmgn_quote_price_usd_v2(mint: str) -> float:
     try:
