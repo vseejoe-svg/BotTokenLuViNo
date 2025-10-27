@@ -1227,7 +1227,7 @@ AW_CFG = {
     "sscore_min_add":      max(0, min(100, AW_SSCORE_MIN_ADD)),
     "sscore_min_observe":  max(0, min(100, AW_SSCORE_MIN_OBS)),
     "mom_enable":        (os.environ.get("AW_MOM_PASS_ENABLE","1").strip().lower() in ("1","true","yes","on")),
-    "mom_top":           int(os.environ.get("AW_MOM_TOP","20")),
+    "mom_top":           int(os.environ.get("AW_MOM_TOP","12")),
     "mom_max_age":       int(os.environ.get("AW_MOM_MAX_AGE","180")),
     "mom_min_lp":      float(os.environ.get("AW_MOM_MIN_LP","0.3")),
     "mom_min_vol":     float(os.environ.get("AW_MOM_MIN_VOL","300")),
@@ -5283,6 +5283,60 @@ async def cmd_aw_now(update: Update, context: ContextTypes.DEFAULT_TYPE):
         *(_aw_cfg_snapshot_text()),
     ]
     await send(update, "\n".join(lines))
+    
+#===============================================================================
+
+async def cmd_diag_webhook(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """
+    /diag_webhook – zeigt den Status des aktuell gesetzten Telegram-Webhooks:
+      • URL, IP, Pending Updates
+      • letzte Fehler & Zeitpunkte
+      • max_connections, allowed_updates
+    """
+    if not guard(update):
+        return
+
+    def _ts(u: int | None) -> str:
+        if not u:
+            return "-"
+        try:
+            return dt.datetime.utcfromtimestamp(int(u)).strftime("%Y-%m-%d %H:%M:%S") + "Z"
+        except Exception:
+            return "-"
+
+    try:
+        info = await context.bot.get_webhook_info()
+    except Exception as e:
+        return await send(update, f"❌ getWebhookInfo Fehler: {e}")
+
+    lines = [
+        "🧪 <b>Webhook Diagnose</b>",
+        f"URL: <code>{(info.url or '-')}</code>",
+        f"IP: <code>{getattr(info, 'ip_address', None) or '-'}</code>",
+        f"CustomCert: <code>{'True' if info.has_custom_certificate else 'False'}</code>",
+        f"Pending Updates: <code>{info.pending_update_count}</code>",
+    ]
+
+    # optionale Felder
+    if getattr(info, "last_error_date", None):
+        msg = getattr(info, "last_error_message", "") or ""
+        lines.append(f"Last Error: <code>{_ts(info.last_error_date)}</code> — {msg}")
+    if getattr(info, "last_synchronization_error_date", None):
+        lines.append(f"Last Sync Error: <code>{_ts(info.last_synchronization_error_date)}</code>")
+
+    if getattr(info, "max_connections", None):
+        lines.append(f"Max Connections: <code>{info.max_connections}</code>")
+
+    if getattr(info, "allowed_updates", None):
+        aus = ", ".join(info.allowed_updates) if info.allowed_updates else "-"
+        lines.append(f"Allowed Updates: <code>{aus}</code>")
+
+    await update.effective_chat.send_message(
+        "\n".join(lines),
+        parse_mode=ParseMode.HTML,
+        disable_web_page_preview=True,
+    )
+
 
 #===============================================================================
 # /boot & /shutdown
@@ -5331,6 +5385,7 @@ async def build_app():
     app.add_handler(CommandHandler("aw_observe",  cmd_aw_observe))                 # neuer Command
     app.add_handler(CallbackQueryHandler(on_observe_add_callback,  pattern=r"^obsadd\|"))
     app.add_handler(CallbackQueryHandler(on_observe_remove_callback, pattern=r"^obsrm\|"))
+    app.add_handler(CommandHandler("diag_webhook", cmd_diag_webhook))
     return app
 
 POLLING_STARTED = False
