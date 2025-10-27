@@ -5483,7 +5483,9 @@ async def cmd_boot(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     # 2) Auto-Watch (nur wenn vorhanden)
     autowatch = globals().get("autowatch_loop", None)
-    msgs.append(await _start_bg_task("AutoWatch", "AUTOWATCH_TASK", autowatch, APP))
+   # msgs.append(await _start_bg_task("AutoWatch", "AUTOWATCH_TASK", autowatch, APP))
+    msgs.append(await _start_bg_task("AutoWatch", "AUTOWATCH_TASK", aw_loop))
+
 
     # 3) Auto-Liquidity (nur wenn vorhanden)
     autoliq = globals().get("auto_liquidity_loop", None)
