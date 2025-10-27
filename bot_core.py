@@ -38,8 +38,6 @@ from solders.signature import Signature as Sig
 from telegram import InlineKeyboardMarkup, InlineKeyboardButton
 from telegram.constants import ParseMode
 
-from collections import deque
-from dataclasses import dataclass, field
 # =========================
 # ENV / Konfiguration
 # =========================
@@ -153,15 +151,17 @@ def _mkdq():
     return deque(maxlen=SERIES_MAXLEN)
 
 def _drop_mint_state(m: str):
-    """
-    Räumt sämtlichen per-Mint State konsequent auf, damit keine 'Leichen'
-    im Speicher verbleiben (klassischer Leak-Fix).
-    """
     for d in (ENGINES, BUILDERS, BAR_COUNTER, INDI_STATES, _last_debug_ts, LAST_OHLCV_TS):
         try:
             d.pop(m, None)
         except Exception:
             pass
+    # NEU: auch Caches räumen
+    try: _DEX_CACHE.pop(m, None)
+    except Exception: pass
+    try: _DECIMALS_CACHE.pop(m, None)
+    except Exception: pass
+
 
 def _rss_mb() -> float:
     """Optionales Monitoring: Resident Set Size in MB (psutil optional)."""
@@ -4702,11 +4702,15 @@ async def cmd_list_watch(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     if nm: name = nm
                     if ag: age_txt = ag
             except Exception:
-                # Fallback auf Meta
+                # Fallback ohne Buttons/HTML
                 try:
-                    nm, ag = dexscreener_token_meta(mint)
-                    if nm: name = nm
-                    if ag: age_txt = ag
+                    plain_name, _ = dexscreener_token_meta(mint)
+                    await send(
+                        update,
+                        f"{plain_name} ({mint[:6]}…)\n"
+                        f" age={age_txt}  mcap≈{_fmt_usd(mcap_usd)}  vol24≈{_fmt_usd(vol24_usd)}{open_txt}\n"
+                        f"https://dexscreener.com/solana/{mint}"
+                    )
                 except Exception:
                     pass
 
