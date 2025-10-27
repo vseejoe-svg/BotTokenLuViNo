@@ -37,6 +37,9 @@ from solders.signature import Signature as Sig
 
 from telegram import InlineKeyboardMarkup, InlineKeyboardButton
 from telegram.constants import ParseMode
+
+from collections import deque
+from dataclasses import dataclass, field
 # =========================
 # ENV / Konfiguration
 # =========================
@@ -125,6 +128,8 @@ AW_RUN_TIMEOUT_SEC = int(os.environ.get("AW_RUN_TIMEOUT_SEC", "180"))
 
 # --- Trading-Zeitfenster (lokale Stunden)
 ALLOWED_HOURS_TZ_OFFSET_MIN = int(os.environ.get("ALLOWED_HOURS_TZ_OFFSET_MIN", "0"))
+# Begrenze die Historie pro Mint (Default 3000 Bars; via ENV SERIES_MAXLEN anpassbar)
+SERIES_MAXLEN = int(os.getenv("SERIES_MAXLEN", "3000"))
 
 # Nur in Notebook/Colab sinnvoll. In Produktion mit uvicorn/uvloop NICHT patchen.
 try:
@@ -141,6 +146,30 @@ try:
 except Exception:
     pass
 
+# ==== Memory settings & helpers =============================================
+def _mkdq():
+    # Einheitlicher Deque-Factory mit begrenzter Länge
+    from collections import deque
+    return deque(maxlen=SERIES_MAXLEN)
+
+def _drop_mint_state(m: str):
+    """
+    Räumt sämtlichen per-Mint State konsequent auf, damit keine 'Leichen'
+    im Speicher verbleiben (klassischer Leak-Fix).
+    """
+    for d in (ENGINES, BUILDERS, BAR_COUNTER, INDI_STATES, _last_debug_ts, LAST_OHLCV_TS):
+        try:
+            d.pop(m, None)
+        except Exception:
+            pass
+
+def _rss_mb() -> float:
+    """Optionales Monitoring: Resident Set Size in MB (psutil optional)."""
+    try:
+        import psutil, os as _os
+        return psutil.Process(_os.getpid()).memory_info().rss / (1024 * 1024)
+    except Exception:
+        return -1.0
 # =========================
 # Telegram Hilfsfunktionen
 # =========================
@@ -1202,7 +1231,7 @@ AW_MIN_SCORE            = int(os.getenv("AW_MIN_SCORE", 0))
 AW_REQUIRE_OK           = bool(int(os.getenv("AW_REQUIRE_OK", 1)))
 AW_PRUNE_INACTIVE_MIN   = int(os.getenv("AW_PRUNE_INACTIVE_MIN", 10))
 AW_PRUNE_AGE_MAX_MIN    = int(os.getenv("AW_PRUNE_AGE_MAX_MIN", 0))
-AW_MAX_WATCHLIST        = int(os.getenv("AW_MAX_WATCHLIST", 100))
+AW_MAX_WATCHLIST        = int(os.getenv("AW_MAX_WATCHLIST", 25))
 AW_M5_DELTA             = float(os.getenv("AW_M5_DELTA", 0))
 AW_SANITY_CONC          = int(os.getenv("AW_SANITY_CONC", 1))
 AW_QSCORE_MIN_ADD       = int(os.environ.get("AW_QSCORE_MIN_ADD", "60"))
@@ -1335,7 +1364,6 @@ def _aw_cfg_snapshot_text() -> list[str]:
     ]
 
 #=================================================================================================
-
 async def aw_discover_once() -> dict:
     """
     Führt einen kompletten Durchlauf aus:
@@ -1398,7 +1426,7 @@ async def aw_discover_once() -> dict:
                     to_check.append(mc)
                     mom_set.add(mc.mint)
 
-        # 3) Re-Eval der Observe-Liste (persist) – nicht abgelaufene Kandidaten zusätzlich prüfen
+        # 3) Re-Eval der Observe-Liste (persist)
         obs_map = AW_STATE.setdefault("observed", {})
         ttl_sec = max(1, int(os.environ.get("AW_OBS_TTL_MIN", "30")) * 60)
 
@@ -1409,7 +1437,7 @@ async def aw_discover_once() -> dict:
                 obs_map.pop(m, None)
                 pruned.append((m, "observe_ttl"))
 
-        # Observe-Kandidaten, die nicht in WATCHLIST und noch nicht in to_check sind, ergänzen
+        # Observe-Kandidaten zusätzlich prüfen
         for m, meta in list(obs_map.items()):
             if m in already or any(c.mint == m for c in to_check):
                 continue
@@ -1425,7 +1453,7 @@ async def aw_discover_once() -> dict:
             except Exception as ee:
                 logger.debug(f"[autowatch] observe re-eval skip {m}: {ee}")
 
-        # 4) Sanity für ALLE Kandidaten in to_check
+        # 4) Sanity für ALLE Kandidaten
         sanity: dict[str, dict] = await _aw_sanity_batch([c.mint for c in to_check]) if to_check else {}
 
         # 5) Klassifikation
@@ -1440,46 +1468,39 @@ async def aw_discover_once() -> dict:
             if ok and sscore >= AW_CFG["sscore_min_add"] and qscore >= AW_CFG["qscore_min_add"]:
                 return "add"
 
-            # OBSERVE: solide, aber noch nicht add
+            # OBSERVE
             if sscore >= AW_CFG["sscore_min_observe"] and qscore >= AW_CFG["qscore_min_observe"]:
                 return "observe"
 
-            # Momentum-Mindestregel: wenn aus Momentum-Pass, dann wenigstens Observe,
-            # sofern Sanity nicht KO ist und Momentum ausreichend hoch ist.
+            # Momentum-Sonderfall
             if (c.mint in mom_set) and (sscore >= AW_CFG["sscore_min_observe"] or m5_delta >= AW_CFG.get("mom_m5_min_delta", 3)):
                 return "observe"
 
             return "drop"
-            
+
         to_add: list[Candidate] = []
         for c in to_check:
             bucket = _classify(c)
 
             if bucket == "add":
-                # --- NEU: optionales Liquidity-Gate vor ADD ---
+                # Liquidity-Gate vor ADD
                 if AW_ADD_REQUIRE_REFS > 0:
                     try:
                         refs = await _count_liquidity_refs_async(c.mint)
                         total_refs = int(refs.get("total_liq_refs", 0))
                         if total_refs < AW_ADD_REQUIRE_REFS:
-                             # zu wenig on-chain Pools -> zunächst persistente Observe-Merkliste
                             observed.append((c.mint, c.symbol))
                             AW_STATE.setdefault("observed", {})[c.mint] = {"sym": c.symbol, "ts": now}
-                            continue  # NICHT adden
+                            continue
                     except Exception:
-                        # im Zweifel konservativ: erst Observe
                         observed.append((c.mint, c.symbol))
                         AW_STATE.setdefault("observed", {})[c.mint] = {"sym": c.symbol, "ts": now}
                         continue
-
-                # Gate bestanden -> in ADD-Liste
                 to_add.append(c)
 
             elif bucket == "observe":
                 observed.append((c.mint, c.symbol))
-                # refresh / persist Observe
                 AW_STATE.setdefault("observed", {})[c.mint] = {"sym": c.symbol, "ts": now}
-            # else: drop -> nichts tun
 
         # 6) Add in die Watchlist (kappen bei max_size)
         for c in to_add:
@@ -1508,15 +1529,25 @@ async def aw_discover_once() -> dict:
             })
             if active:
                 st["last_active_ts"] = now
-            # age-based prune (optional)
+
+            # age-based prune
             if AW_CFG["prune_age_max_min"] > 0 and (age_m is not None) and (age_m > AW_CFG["prune_age_max_min"]):
-                WATCHLIST.remove(m); AW_STATE["mints"].pop(m, None)
+                WATCHLIST.remove(m)
+                AW_STATE["mints"].pop(m, None)
                 pruned.append((m, "age"))
+                # <<< FIX: State freigeben
+                if m not in OPEN_POS:
+                    _drop_mint_state(m)
                 continue
+
             # inactivity prune
             if (now - int(st.get("last_active_ts") or now)) >= AW_CFG["prune_inactive_min"] * 60:
-                WATCHLIST.remove(m); AW_STATE["mints"].pop(m, None)
+                WATCHLIST.remove(m)
+                AW_STATE["mints"].pop(m, None)
                 pruned.append((m, "inactive"))
+                # <<< FIX: State freigeben
+                if m not in OPEN_POS:
+                    _drop_mint_state(m)
 
         # 8) Kappung der Watchlist (nach Aktivität/Score)
         if len(WATCHLIST) > AW_CFG["max_size"]:
@@ -1532,12 +1563,31 @@ async def aw_discover_once() -> dict:
                     WATCHLIST.remove(m)
                     AW_STATE["mints"].pop(m, None)
                     pruned.append((m, "cap"))
+                    # <<< FIX: State freigeben
+                    if m not in OPEN_POS:
+                        _drop_mint_state(m)
 
         # 9) persist state & summary
         AW_STATE["last_run_ts"] = now
         _aw_save_state(AW_STATE)
 
+        # 10) Opportunistisches Aufräumen (Fallback, falls etwas durchgerutscht ist)
+        # <<< SWEEP
+        live = set(WATCHLIST) | set(OPEN_POS.keys())
+        for m in list(ENGINES.keys()):
+            if m not in live:
+                _drop_mint_state(m)
+
+        # 11) kleines Memory-Log
+        # <<< LOG
+        try:
+            logger.info("[aw] run: added=%d observed=%d pruned=%d | wl=%d | rss=%.1fMB",
+                        len(added), len(observed), len(pruned), len(WATCHLIST), _rss_mb())
+        except Exception:
+            pass
+
         return {"added": added, "observed": observed, "pruned": pruned, "n": len(core_cands)}
+
         
 #=================================================================================================
 
@@ -2682,12 +2732,14 @@ class Config:
     time_exit_bars: int = 60 # 900
     allowed_hours_csv: str  = "2,3,4,5,10,11,12,13,14,15,16,23"
 
+
+
 @dataclass
 class State:
-    closes: deque = field(default_factory=lambda: deque(maxlen=10000))
-    highs:  deque  = field(default_factory=lambda: deque(maxlen=10000))
-    lows:   deque  = field(default_factory=lambda: deque(maxlen=10000))
-    vols:   deque  = field(default_factory=lambda: deque(maxlen=10000))
+    closes: deque = field(default_factory=_mkdq)
+    highs:  deque = field(default_factory=_mkdq)
+    lows:   deque = field(default_factory=_mkdq)
+    vols:   deque = field(default_factory=_mkdq)
 
     prev_close: Optional[float] = None
     prev_high: Optional[float]  = None
@@ -2721,6 +2773,7 @@ class State:
     trades_this_hour: int = 0
     last_hour_id: Optional[int] = None
     bar_index: int = 0
+
 
 class SwingBotV163:
     def __init__(self, cfg: Config):
@@ -3074,11 +3127,13 @@ def _liq_format_line(mint: str, cur: dict, prev: dict) -> str:
 async def _liq_maybe_prune(mint: str, cur: dict) -> Optional[str]:
     if not LIQ_CFG["prune_empty"]:
         return None
-    if int(cur.get("total_refs",0)) == 0:
+    if int(cur.get("total_refs", 0)) == 0:
         if mint in WATCHLIST:
             WATCHLIST.remove(mint)
         LIQ_STATE["mints"].pop(mint, None)
-        _liq_save_state(LIQ_STATE)
+        # <<< FIX: State freigeben, sofern keine offene Position
+        if mint not in OPEN_POS:
+            _drop_mint_state(mint)
         return "pruned: no pools"
     return None
 
@@ -3248,12 +3303,15 @@ async def cmd_check_liq(update: Update, context: ContextTypes.DEFAULT_TYPE):
 #===============================================================================
 # INDICATORS & IO (integriertes Zusatz-Modul)
 #===============================================================================
+from typing import Deque
+
 @dataclass
 class IndiState:
-    closes: Deque[float] = field(default_factory=lambda: deque(maxlen=10_000))
-    highs:  Deque[float] = field(default_factory=lambda: deque(maxlen=10_000))
-    lows:   Deque[float] = field(default_factory=lambda: deque(maxlen=10_000))
-    vols:   Deque[float] = field(default_factory=lambda: deque(maxlen=10_000))
+    closes: Deque[float] = field(default_factory=_mkdq)
+    highs:  Deque[float] = field(default_factory=_mkdq)
+    lows:   Deque[float] = field(default_factory=_mkdq)
+    vols:   Deque[float] = field(default_factory=_mkdq)
+
     prev_close: Optional[float] = None
     prev_high:  Optional[float] = None
     prev_low:   Optional[float] = None
@@ -3267,8 +3325,7 @@ class IndiState:
     init_count: int = 0
     ema_pb: Optional[float] = None
     sma_vol_50: Optional[float] = None
-    bar_index: int = 0
-    
+    bar_index: int = 0    
 #===============================================================================
 # ---------- Optionaler OHLCV-Fetcher (Birdeye) MIT HTTP-STATUS ----------
 def fetch_birdeye_ohlcv_5s(mint: str, api_key: str, limit: int = 120, chain: str = "sol") -> tuple[list[dict], int]:
@@ -4549,28 +4606,29 @@ async def on_cb_remove_watch(update: Update, context: ContextTypes.DEFAULT_TYPE)
 
     mint = data.split("|", 1)[1].strip()
 
-    # Mint entfernen, falls vorhanden
     removed = False
     if mint in WATCHLIST:
         WATCHLIST.remove(mint)
         removed = True
+        # <<< FIX: State freigeben, wenn keine offene Position vorhanden
+        if mint not in OPEN_POS:
+            _drop_mint_state(mint)
 
-    # Optional: Name/Alter für Feedback
-    try:
-        name, _age = dexscreener_token_meta(mint)
-    except Exception:
-        name = mint[:6] + "…"
-
-    # Tastatur entfernen und Bestätigung schicken
     try:
         await q.edit_message_reply_markup(reply_markup=None)
     except Exception:
         pass
 
+    try:
+        name, _age = dexscreener_token_meta(mint)
+    except Exception:
+        name = mint[:6] + "…"
+
     if removed:
         await q.message.chat.send_message(f"🗑 Entfernt: {name} ({mint[:6]}…)")
     else:
         await q.message.chat.send_message(f"ℹ️ Bereits nicht mehr in Watchlist: {name} ({mint[:6]}…)")
+
 
 
 async def cmd_list_watch(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -4709,11 +4767,20 @@ async def cmd_add_watch(update: Update, context: ContextTypes.DEFAULT_TYPE):
 #===============================================================================
 
 async def cmd_remove_watch(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not guard(update): return
-    if not context.args: return await send(update,"/remove_watch <MINT>")
-    m=context.args[0].strip()
-    if m in WATCHLIST: WATCHLIST.remove(m)
-    await send(update, f"🗑️ entfernt: {m}")
+    if not guard(update):
+        return
+    if not context.args:
+        return await send(update, "/remove_watch <MINT>")
+    m = context.args[0].strip()
+    if m in WATCHLIST:
+        WATCHLIST.remove(m)
+        # <<< FIX: State freigeben, falls keine offene Position
+        if m not in OPEN_POS:
+            _drop_mint_state(m)
+        await send(update, f"🗑️ entfernt: {m}")
+    else:
+        await send(update, f"ℹ️ nicht in Watchlist: {m}")
+
 #===============================================================================
 async def cmd_dashboard(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """
