@@ -6206,46 +6206,45 @@ try:
     from fastapi import FastAPI, Request
     from fastapi.responses import PlainTextResponse, JSONResponse
 except Exception:
-    FastAPI = None  # falls FastAPI nicht installiert ist
+    FastAPI = None
 
 if FastAPI:
     svc = FastAPI(title="LuViNoCryptoBot")
 
-    @svc.get("/", include_in_schema=False)
-    async def _root_get():
-        # Render erwartet auf GET/HEAD 200 – kein 404/405, sonst killen sie den Prozess
+    # 200 auf / für GET und HEAD
+    @svc.api_route("/", methods=["GET", "HEAD"], include_in_schema=False)
+    async def _root_ok():
         return PlainTextResponse("ok", status_code=200)
 
-    @svc.head("/", include_in_schema=False)
-    async def _root_head():
+    # Catch-all für HEAD (zur Sicherheit überall 200)
+    @svc.api_route("/{path:path}", methods=["HEAD"], include_in_schema=False)
+    async def _any_head(path: str):
         return PlainTextResponse("", status_code=200)
 
     @svc.get("/healthz")
     async def _healthz():
-        return JSONResponse({"status": "ok", "aw_running": bool(AW_CFG.get("enabled")), "liq_running": bool(LIQ_CFG.get("enabled"))})
+        return JSONResponse({
+            "status": "ok",
+            "aw_running": bool(AW_CFG.get("enabled")),
+            "liq_running": bool(LIQ_CFG.get("enabled"))
+        })
 
     @svc.on_event("startup")
     async def _on_startup():
-        # PTB-Application nur einmal bauen/initialisieren
-        global APP, AUTO_TASK, AUTOWATCH_TASK, AUTO_LIQ_TASK
+        # PTB-App nur einmal bauen
+        global APP, AUTOWATCH_TASK, AUTO_LIQ_TASK
         if APP is None:
-            # baut Handlers und registriert Telegram-Commands
             APP = await build_app()
             await APP.initialize()
-            # Wenn du Webhook-Modus nutzt, hier ggf. Hook setzen:
-            # if os.getenv("USE_WEBHOOK") == "1":
-            #     public = os.environ["PUBLIC_URL"].rstrip("/")
-            #     await APP.bot.set_webhook(f"{public}/tg/{TELEGRAM_BOT_ID or TELEGRAM_BOT_TOKEN}")
-        # Background-Loops automatisch starten
+        # Background-Loops starten (nur wenn enabled)
         if AW_CFG.get("enabled") and (AUTOWATCH_TASK is None or AUTOWATCH_TASK.done()):
-            AUTOWATCH_TASK = asyncio.create_task(aw_loop())  # nutzt deine vorhandene Funktion/Globals
+            AUTOWATCH_TASK = asyncio.create_task(aw_loop())
         if LIQ_CFG.get("enabled") and (AUTO_LIQ_TASK is None or AUTO_LIQ_TASK.done()):
             LIQ_CFG["enabled"] = True
             AUTO_LIQ_TASK = asyncio.create_task(auto_liq_loop())
 
     @svc.on_event("shutdown")
     async def _on_shutdown():
-        # sauber abbremsen, damit Render-„Shutting down…“ nicht mitten im Durchlauf abbricht
         await _stop_task("AutoLiquidity", "AUTO_LIQ_TASK")
         await _stop_task("AutoWatch", "AUTOWATCH_TASK")
         if APP:
