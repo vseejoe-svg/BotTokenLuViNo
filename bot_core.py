@@ -6201,13 +6201,63 @@ async def run_with_reconnect():
     finally:
         POLLING_STARTED = False
 
-#try:
-#   tok = os.environ["TELEGRAM_BOT_TOKEN"].strip()
-#    r = requests.get(f"https://api.telegram.org/bot{tok}/getMe", timeout=10)
-#    print("[getMe]", r.status_code, r.text[:120])
-#except Exception as e:
-#    print("[getMe] Fehler:", e)
+# ==== ASGI-Server & Health-Endpoints für Render ==============================
+try:
+    from fastapi import FastAPI, Request
+    from fastapi.responses import PlainTextResponse, JSONResponse
+except Exception:
+    FastAPI = None  # falls FastAPI nicht installiert ist
 
-#if __name__ == "__main__":
-#    import asyncio as _a
-#    _a.run(run_with_reconnect())
+if FastAPI:
+    svc = FastAPI(title="LuViNoCryptoBot")
+
+    @svc.get("/", include_in_schema=False)
+    async def _root_get():
+        # Render erwartet auf GET/HEAD 200 – kein 404/405, sonst killen sie den Prozess
+        return PlainTextResponse("ok", status_code=200)
+
+    @svc.head("/", include_in_schema=False)
+    async def _root_head():
+        return PlainTextResponse("", status_code=200)
+
+    @svc.get("/healthz")
+    async def _healthz():
+        return JSONResponse({"status": "ok", "aw_running": bool(AW_CFG.get("enabled")), "liq_running": bool(LIQ_CFG.get("enabled"))})
+
+    @svc.on_event("startup")
+    async def _on_startup():
+        # PTB-Application nur einmal bauen/initialisieren
+        global APP, AUTO_TASK, AUTOWATCH_TASK, AUTO_LIQ_TASK
+        if APP is None:
+            # baut Handlers und registriert Telegram-Commands
+            APP = await build_app()
+            await APP.initialize()
+            # Wenn du Webhook-Modus nutzt, hier ggf. Hook setzen:
+            # if os.getenv("USE_WEBHOOK") == "1":
+            #     public = os.environ["PUBLIC_URL"].rstrip("/")
+            #     await APP.bot.set_webhook(f"{public}/tg/{TELEGRAM_BOT_ID or TELEGRAM_BOT_TOKEN}")
+        # Background-Loops automatisch starten
+        if AW_CFG.get("enabled") and (AUTOWATCH_TASK is None or AUTOWATCH_TASK.done()):
+            AUTOWATCH_TASK = asyncio.create_task(aw_loop())  # nutzt deine vorhandene Funktion/Globals
+        if LIQ_CFG.get("enabled") and (AUTO_LIQ_TASK is None or AUTO_LIQ_TASK.done()):
+            LIQ_CFG["enabled"] = True
+            AUTO_LIQ_TASK = asyncio.create_task(auto_liq_loop())
+
+    @svc.on_event("shutdown")
+    async def _on_shutdown():
+        # sauber abbremsen, damit Render-„Shutting down…“ nicht mitten im Durchlauf abbricht
+        await _stop_task("AutoLiquidity", "AUTO_LIQ_TASK")
+        await _stop_task("AutoWatch", "AUTOWATCH_TASK")
+        if APP:
+            await APP.shutdown()
+
+    # Optionaler Telegram-WebHook-Endpoint (nur falls du mit WebHook statt /boot+polling arbeitest)
+    # @svc.post("/tg/{token}")
+    # async def telegram_webhook(token: str, request: Request):
+    #     if token != TELEGRAM_BOT_TOKEN:
+    #         return PlainTextResponse("forbidden", status_code=403)
+    #     data = await request.json()
+    #     update = Update.de_json(data, APP.bot)
+    #     await APP.process_update(update)
+    #     return JSONResponse({"ok": True})
+
