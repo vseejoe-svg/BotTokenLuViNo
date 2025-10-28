@@ -37,6 +37,46 @@ from solders.signature import Signature as Sig
 
 from telegram import InlineKeyboardMarkup, InlineKeyboardButton
 from telegram.constants import ParseMode
+# ===============================================================================
+import asyncio, os  # <-- falls oben noch nicht vorhanden
+import contextlib
+
+
+# Minimaler HTTP-Server für Render-Healthcheck (hält die Instanz wach)
+async def start_keepalive_server():
+    """
+    Bindet an $PORT (Default 10000) und beantwortet GETs auf /healthz (und alles andere)
+    mit 200 OK. In Render -> Service -> Health check path: /healthz setzen!
+    """
+    port = int(os.environ.get("PORT", "10000"))
+
+    async def _handle(reader: asyncio.StreamReader, writer: asyncio.StreamWriter):
+        try:
+            # Request-Header bis zum leeren CRLF einlesen (vereinfacht)
+            await reader.readuntil(b"\r\n\r\n")
+        except Exception:
+            pass
+        # Immer 200 OK mit kleinem Body zurückgeben
+        resp = (
+            b"HTTP/1.1 200 OK\r\n"
+            b"Content-Type: text/plain; charset=utf-8\r\n"
+            b"Content-Length: 2\r\n"
+            b"Connection: close\r\n\r\nOK"
+        )
+        try:
+            writer.write(resp)
+            await writer.drain()
+        finally:
+            with contextlib.suppress(Exception):
+                writer.close()
+
+    server = await asyncio.start_server(_handle, host="0.0.0.0", port=port)
+    addrs = ", ".join(str(s.getsockname()) for s in (server.sockets or []))
+    logger.info("KeepAlive HTTP server listening on %s (health: GET /healthz)", addrs)
+    async with server:
+        await server.serve_forever()
+# ===============================================================================
+
 
 # =========================
 # ENV / Konfiguration
@@ -5721,9 +5761,40 @@ async def _stop_task(name: str, holder: str):
     except Exception as e:
         return f"⚠️ {name}: {e}"
 
+# ==
+import httpx  # falls noch nicht vorhanden
+
+async def start_render_self_ping(interval: int = 300):
+    """
+    Pingt alle `interval` Sekunden die eigene Render-URL /healthz an.
+    Hält Free-Instanzen wach, wenn kein offizieller Health-Check gesetzt ist.
+    Erwartet RENDER_EXTERNAL_URL oder RENDER_EXTERNAL_HOSTNAME.
+    """
+    ext = os.environ.get("RENDER_EXTERNAL_URL") or os.environ.get("RENDER_EXTERNAL_HOSTNAME")
+    if not ext:
+        logger.warning("Self-Ping deaktiviert: RENDER_EXTERNAL_URL/RENDER_EXTERNAL_HOSTNAME fehlt.")
+        return
+
+    url = (ext if ext.startswith("http") else f"https://{ext}") + "/healthz"
+    await asyncio.sleep(5)  # kurz warten, bis der Keep-Alive lauscht
+
+    async with httpx.AsyncClient(timeout=10) as client:
+        while True:
+            try:
+                await client.get(url)
+                logger.debug("Keep-alive ping OK -> %s", url)
+            except Exception as e:
+                logger.debug("Keep-alive ping fehlgeschlagen: %s", e)
+            await asyncio.sleep(interval)
+
+
 async def cmd_boot(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not guard(update):
         return
+    # --- KeepAlive-HTTP-Server auf $PORT starten (nur im Polling-Betrieb!)
+    asyncio.create_task(start_keepalive_server())
+    # optional: externen Self-Ping aktivieren (siehe unten)
+    asyncio.create_task(start_render_self_ping())  # optional
     msgs = []
     # 1) Haupt-Strategie-Loop
     msgs.append(await _start_bg_task("AutoLoop", "AUTO_TASK", auto_loop, APP))
@@ -5732,7 +5803,6 @@ async def cmd_boot(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # 3) Auto-Liquidity (korrekter Funktionsname!)
     msgs.append(await _start_bg_task("AutoLiquidity", "AUTO_LIQ_TASK", auto_liq_loop))
     await send(update, "\n".join(msgs))
-
 
 
 async def cmd_shutdown(update: Update, context: ContextTypes.DEFAULT_TYPE):
