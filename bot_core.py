@@ -6288,7 +6288,7 @@ def _ext_base_url() -> str:
     return ext.rstrip("/")
 
 if FastAPI:
-    svc = FastAPI(title="LuViNoCryptoBot")
+    svc = FastAPI(title="bottokenluvino-1")
 
     # 200 auf / (GET/HEAD)
     @svc.api_route("/", methods=["GET", "HEAD"], include_in_schema=False)
