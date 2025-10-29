@@ -6262,116 +6262,105 @@ async def run_with_reconnect():
         POLLING_STARTED = False
 
         
-# ==== ASGI-Server (Option A): FastAPI + Telegram Webhook für Render ====
-try:
-    from fastapi import FastAPI, Request
-    from fastapi.responses import PlainTextResponse, JSONResponse
-except Exception:
-    FastAPI = None  # FastAPI nicht verfügbar -> kein ASGI-Modus
+# ==== ASGI-Server & Health-Endpoints + Telegram Webhook (Option A) ====
+from fastapi import FastAPI, Request
+from fastapi.responses import JSONResponse, PlainTextResponse
 
-def _ext_base_url() -> str:
-    """
-    Ermittelt die externe Basis-URL für den Webhook.
-    Bevorzugt WEBHOOK_BASE_URL, sonst Render-Variablen.
-    Beispielwert: https://bottokenluvlnio-1.onrender.com
-    """
-    ext = (
-        os.getenv("WEBHOOK_BASE_URL")
-        or os.getenv("RENDER_EXTERNAL_URL")
-        or os.getenv("RENDER_EXTERNAL_HOSTNAME")
-        or ""
-    ).strip()
-    if not ext:
-        return ""
-    if not ext.startswith("http"):
-        ext = "https://" + ext
-    return ext.rstrip("/")
+# ACHTUNG: Stelle sicher, dass diese ENV-Variablen in Render gesetzt sind:
+# TELEGRAM_BOT_TOKEN       -> dein Bot-Token, z.B. 123456:AA...
+# TELEGRAM_ALLOWED_CHAT_ID -> deine numerische Chat-ID
+# WEBHOOK_BASE_BAKE_URL    -> z.B. https://dein-service.onrender.com  (ohne trailing Slash!)
+WEBHOOK_BASE_URL = os.environ.get("WEBHOOK_BASE_URL", "").rstrip("/")
+if not WEBHOOK_BASE_URL:
+    logger.warning("WEBHOOK_BASE_URL ist NICHT gesetzt – Telegram-Webhook kann nicht funktionieren!")
 
-if FastAPI:
-    svc = FastAPI(title="bottokenluvino-1")
+# Optional: zusätzlicher Schutz (Telegram sendet dann den Secret-Header mit)
+TELEGRAM_WEBHOOK_SECRET = os.environ.get("TELEGRAM_WEBHOOK_SECRET", "")
 
-    # 200 auf / (GET/HEAD)
-    @svc.api_route("/", methods=["GET", "HEAD"], include_in_schema=False)
-    async def _root_ok():
-        return PlainTextResponse("ok", status_code=200)
+# Unsere FastAPI-App, die Uvicorn startet
+svc = FastAPI(title="LuViNoCryptoBot")
 
-    # Healthcheck-Endpoint für Render
-    @svc.get("/healthz")
-    async def _healthz():
-        return JSONResponse(
-            {
-                "status": "ok",
-                "aw_running": bool(AW_CFG.get("enabled")),
-                "liq_running": bool(LIQ_CFG.get("enabled")),
-            }
-        )
+@svc.get("/healthz")
+async def _healthz():
+    return {
+        "status": "ok",
+        "aw_running": bool(AW_CFG.get("enabled")),
+        "liq_running": bool(LIQ_CFG.get("enabled")),
+    }
 
-    # Telegram Webhook-Endpoint (geheimes Token in der URL prüfen)
-    @svc.post("/tg/{token}")
-    async def telegram_webhook(token: str, request: Request):
-        if token != TELEGRAM_BOT_TOKEN:
-            return PlainTextResponse("forbidden", status_code=403)
-        data = await request.json()
-        update = Update.de_json(data, APP.bot)
-        # Application muss laufen (start()), damit Jobs/Handler funktionieren
-        await APP.process_update(update)
-        return JSONResponse({"ok": True})
+@svc.on_event("startup")
+async def _on_startup():
+    """Baut die PTB Application, setzt den Telegram-WebHook und startet optionale Loops."""
+    global APP, AUTOWATCH_TASK, AUTO_LIQ_TASK
 
-    @svc.on_event("startup")
-    async def _on_startup():
-        """
-        - PTB Application bauen/initialisieren
-        - Application starten (keine Polling/kein PTB-Webserver)
-        - Telegram Webhook auf unseren FastAPI-Endpoint setzen
-        - Hintergrund-Loops starten (AW/LIQ), falls enabled
-        """
-        global APP, AUTOWATCH_TASK, AUTO_LIQ_TASK
+    # PTB Application 1x bauen/initialisieren
+    if APP is None:
+        APP = await build_app()
+        await APP.initialize()
+        logger.info("PTB Application initialisiert.")
 
-        # PTB-App einmalig erzeugen
-        if APP is None:
-            APP = await build_app()
-            await APP.initialize()
-
-        # PTB intern starten (JobQueue etc.); NICHT run_polling / run_webhook!
-        await APP.start()
-
-        # Webhook setzen
-        base = _ext_base_url()
-        if not base:
-            logger.warning(
-                "WEBHOOK_BASE_URL/RENDER_EXTERNAL_URL/RENDER_EXTERNAL_HOSTNAME nicht gesetzt – "
-                "Telegram-Kommandos werden NICHT zugestellt!"
-            )
-        else:
-            hook_url = f"{base}/tg/{TELEGRAM_BOT_TOKEN}"
-            try:
-                # altes Webhook-Target ersetzen
-                await APP.bot.set_webhook(hook_url, drop_pending_updates=True)
-                logger.info("Telegram webhook gesetzt: %s", hook_url)
-            except Exception as e:
-                logger.exception("Webhook setzen fehlgeschlagen: %s", e)
-
-        # Background-Loops
-        if AW_CFG.get("enabled") and (AUTOWATCH_TASK is None or AUTOWATCH_TASK.done()):
-            AUTOWATCH_TASK = asyncio.create_task(aw_loop())
-        if LIQ_CFG.get("enabled") and (AUTO_LIQ_TASK is None or AUTO_LIQ_TASK.done()):
-            AUTO_LIQ_TASK = asyncio.create_task(auto_liq_loop())
-
-    @svc.on_event("shutdown")
-    async def _on_shutdown():
-        # Loops sauber stoppen
-        await _stop_task("AutoLiquidity", "AUTO_LIQ_TASK")
-        await _stop_task("AutoWatch", "AUTOWATCH_TASK")
-
-        # Webhook entfernen (optional) und PTB sauber beenden
+    # Webhook setzen (alte zuerst löschen)
+    if WEBHOOK_BASE_URL:
+        hook_url = f"{WEBHOOK_BASE_URL}/tg/{TELEGRAM_BOT_TOKEN}"
         try:
             await APP.bot.delete_webhook(drop_pending_updates=True)
         except Exception:
             pass
-        if APP:
-            try:
-                await APP.stop()
-            except Exception:
-                pass
-            await APP.shutdown()
+        try:
+            await APP.bot.set_webhook(
+                url=hook_url,
+                allowed_updates=["message", "callback_query", "inline_query"],
+                secret_token=TELEGRAM_WEBHOOK_SECRET or None,
+            )
+            logger.info("Telegram Webhook gesetzt: %s", hook_url)
+        except Exception as e:
+            logger.exception("Webhook setzen fehlgeschlagen: %s", e)
+    else:
+        logger.warning("Kein WEBHOOK_BASE_URL -> eingehende Telegram-Updates funktionieren NICHT.")
 
+    # Background-Loops bei Bedarf starten
+    if AW_CFG.get("enabled") and (AUTOWATCH_TASK is None or AUTOWATCH_TASK.done()):
+        AUTOWATCH_TASK = asyncio.create_task(aw_loop())
+        logger.info("AutoWatch gestartet.")
+    if LIQ_CFG.get("enabled") and (AUTO_LIQ_TASK is None or AUTO_LIQ_TASK.done()):
+        AUTO_LIQ_TASK = asyncio.create_task(auto_liq_loop())
+        logger.info("AutoLiquidity gestartet.")
+
+@svc.on_event("shutdown")
+async def _on_shutdown():
+    """Sauberes Stoppen bei Service-Shutdown."""
+    await _stop_task("AutoLiquidity", "AUTO_LIQ_TASK")
+    await _stop_task("AutoWatch", "AUTOWATCH_TASK")
+    try:
+        await APP.bot.delete_webhook(drop_pending_updates=True)
+    except Exception:
+        pass
+    if APP:
+        try:
+            await APP.stop()
+        except Exception:
+            pass
+        await APP.shutdown()
+    logger.info("Shutdown complete.")
+
+@svc.post("/tg/{token}")
+async def telegram_webhook(token: str, request: Request):
+    """Telegram → FastAPI: Hier kommen Updates an. Wir prüfen Token & optional Secret, dann dispatchen wir."""
+    if token != TELEGRAM_BOT_TOKEN:
+        return PlainTextResponse("forbidden", status_code=403)
+
+    if TELEGRAM_WEBHOOK_SECRET:
+        sent_secret = request.headers.get("X-Telegram-Bot-Api-Secret-Token", "")
+        if sent_secret != TELEGRAM_WEBHOOK_SECRET:
+            return PlainTextResponse("bad secret", status_code=403)
+
+    try:
+        data = await request.json()
+        upd = Update.de_json(data, APP.bot)
+        # Wir benutzen hier process_update (keine PTB-eigene Webserver-Schicht)
+        await APP.process_update(upd)
+    except Exception as e:
+        logger.exception("Webhook-Handling-Fehler: %s", e)
+        return JSONResponse({"ok": False})
+
+    return JSONResponse({"ok": True})
