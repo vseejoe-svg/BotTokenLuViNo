@@ -6261,30 +6261,29 @@ async def run_with_reconnect():
     finally:
         POLLING_STARTED = False
 
-        
+
 # ===================== ASGI-Server & Webhook (für Render) =====================
 # Ersetzt den bisherigen "ASGI-Server & Health-Endpoints"-Block vollständig.
 
 try:
     from fastapi import FastAPI, Request
     from fastapi.responses import PlainTextResponse, JSONResponse
-except Exception:  # falls FastAPI lokal nicht installiert ist
+except Exception:
     FastAPI = None
 
 # ---- Hilfsfunktion: externe Basis-URL (Render/ENV) ---------------------------
 def _ext_base_url() -> str:
     """
     Liefert die Basis-URL für den Webhook, z.B.
-    - WEBHOOK_BASE_URL   (manuell gepflegt)   oder
-    - RENDER_EXTERNAL_URL / RENDER_EXTERNAL_HOSTNAME (von Render gesetzt)
-
-    Rückgabe inkl. https:// und ohne abschließenden Slash.
+    - WEBHOOK_BASE_URL (manuell) oder
+    - RENDER_EXTERNAL_URL / RENDER_EXTERNAL_HOSTNAME (von Render)
+    mit https:// und ohne finalen Slash.
     """
     base = (
         os.environ.get("WEBHOOK_BASE_URL")
-        or os.environ.get("RENDER_EXTERNAL_URL")
-        or os.environ.get("RENDER_EXTERNAL_HOSTNAME")
-        or ""
+        + ""  # vermeidet NoneType
+        if os.environ.get("WEBHOOK_BASE_URL") else
+        (os.environ.get("RENDER_EXTERNAL_URL") or os.environ.get("RENDER_EXTERNAL_HOSTNAME") or "")
     )
     if not base:
         return ""
@@ -6292,7 +6291,6 @@ def _ext_base_url() -> str:
         base = "https://" + base.lstrip("/")
     return base.rstrip("/")
 
-# ---- ASGI-App nur erzeugen, wenn FastAPI vorhanden ist -----------------------
 if FastAPI:
     svc = FastAPI(title="LuViNoCryptoBot")
 
@@ -6303,53 +6301,46 @@ if FastAPI:
 
     @svc.get("/healthz", include_in_schema=False)
     async def _healthz():
-        return JSONResponse(
-            {
-                "status": "ok",
-                "aw_running": bool(AW_CFG.get("enabled")),
-                "liq_running": bool(LIQ_CFG.get("enabled")),
-            }
-        )
+        return JSONResponse({
+            "status": "ok",
+            "aw_running": bool(AW_CFG.get("enabled")),
+            "liq_running": bool(LIQ_CFG.get("enabled")),
+        })
 
     # Webhook-Endpunkt: /tg/<BOT_TOKEN>
     @svc.post("/tg/{token}")
     async def telegram_webhook(token: str, request: Request):
-        # Token aus der URL mit unserem Bot-Token abgleichen
         if token != TELEGRAM_BOT_TOKEN:
             return PlainTextResponse("forbidden", status_code=403)
         if APP is None:
             return PlainTextResponse("app not ready", status_code=503)
-
-        # JSON von Telegram holen und als PTB-Update verarbeiten
         payload = await request.json()
         upd = Update.de_json(payload, APP.bot)
         await APP.update_queue.put(upd)  # an PTB weiterreichen
         return JSONResponse({"ok": True})
 
-    # Startup: PTB starten (ohne Polling) + Webhook setzen + Loops hochfahren
+    # Startup: PTB ohne Polling + Webhook setzen + Loops starten
     @svc.on_event("startup")
     async def _on_startup():
         global APP, AUTOWATCH_TASK, AUTO_LIQ_TASK
 
-        # 1) PTB-Application bauen & initialisieren (falls nicht schon vorhanden)
         if APP is None:
             APP = await build_app()
             await APP.initialize()
 
-        # 2) PTB starten (ohne run_polling / ohne PTB-internen Webserver)
+        # PTB *ohne* Polling starten (nur interner Dispatcher/JobQueue)
         await APP.start()
 
-        # 3) Webhook-URL bestimmen & bei Telegram registrieren
+        # Webhook registrieren
         base = _ext_base_url()
         if not base:
             logger.warning(
-                "Keine Basis-URL gefunden (WEBHOOK_BASE_URL oder RENDER_*). "
-                "Webhook wird nicht registriert – Kommandos kommen dann nur per Polling/Manuell."
+                "WEBHOOK_BASE_URL / RENDER_* nicht gesetzt – kein Webhook registriert."
             )
         else:
             hook_url = f"{base}/tg/{TELEGRAM_BOT_TOKEN}"
             try:
-                # alte Hooks defensiv löschen (PTB v20/21 unterscheidet sich leicht)
+                # evtl. alten Hook löschen (PTB v20/v21 unterscheiden sich bei Signaturen)
                 try:
                     await APP.bot.delete_webhook(drop_pending_updates=True)
                 except TypeError:
@@ -6357,7 +6348,6 @@ if FastAPI:
             except Exception:
                 pass
             try:
-                # neuen Hook setzen
                 try:
                     await APP.bot.set_webhook(hook_url, drop_pending_updates=True)
                 except TypeError:
@@ -6366,13 +6356,13 @@ if FastAPI:
             except Exception as e:
                 logger.exception("Webhook setzen fehlgeschlagen: %s", e)
 
-        # 4) Hintergrund-Loops (falls per Config gewünscht) starten
+        # Hintergrund-Loops (optional) starten
         if AW_CFG.get("enabled") and (AUTOWATCH_TASK is None or AUTOWATCH_TASK.done()):
             AUTOWATCH_TASK = asyncio.create_task(aw_loop())
         if LIQ_CFG.get("enabled") and (AUTO_LIQ_TASK is None or AUTO_LIQ_TASK.done()):
             AUTO_LIQ_TASK = asyncio.create_task(auto_liq_loop())
 
-    # Shutdown: Loops stoppen & PTB sauber beenden
+    # Shutdown: sauber aufräumen
     @svc.on_event("shutdown")
     async def _on_shutdown():
         await _stop_task("AutoLiquidity", "AUTO_LIQ_TASK")
