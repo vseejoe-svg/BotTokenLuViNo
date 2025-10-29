@@ -6262,120 +6262,158 @@ async def run_with_reconnect():
         POLLING_STARTED = False
 
 
-# ===================== ASGI-Server & Webhook (für Render) =====================
-# Ersetzt den bisherigen "ASGI-Server & Health-Endpoints"-Block vollständig.
+# --- ASGI / Webhook-Server (FastAPI) für Render/„dyno“-Betrieb ---
+
+import asyncio
+import os
+import contextlib
+from typing import Optional
+
+from fastapi import FastAPI, Request
+from fastapi.responses import JSONResponse, PlainTextResponse
+import logging
 
 try:
-    from fastapi import FastAPI, Request
-    from fastapi.responses import PlainTextResponse, JSONResponse
+    from telegram import Update
 except Exception:
-    FastAPI = None
+    # PTB wird im build_app() importiert – hier nur Typen optional
+    Update = None  # type: ignore
 
-# ---- Hilfsfunktion: externe Basis-URL (Render/ENV) ---------------------------
-def _ext_base_url() -> str:
+# --------------------------------------------------------------------
+# Konfiguration / Helper
+# --------------------------------------------------------------------
+
+log = logging.getLogger("uvicorn.error")
+
+def _ext_base_url() -> Optional[str]:
     """
-    Liefert die Basis-URL für den Webhook, z.B.
-    - WEBHOOK_BASE_URL (manuell) oder
-    - RENDER_EXTERNAL_URL / RENDER_EXTERNAL_HOSTNAME (von Render)
-    mit https:// und ohne finalen Slash.
+    Liefert die öffentlich erreichbare Basis-URL (ohne Slash am Ende),
+    z. B. https://deinservice.onrender.com
     """
-    base = (
-        os.environ.get("WEBHOOK_BASE_URL")
-        + ""  # vermeidet NoneType
-        if os.environ.get("WEBHOOK_BASE_URL") else
-        (os.environ.get("RENDER_EXTERNAL_URL") or os.environ.get("RENDER_EXTERNAL_HOSTNAME") or "")
-    )
+    base = os.environ.get("WEBHOOK_BASE_URL") or os.environ.get("RENDER_EXTERNAL_URL")
     if not base:
-        return ""
-    if not (base.startswith("http://") or base.startswith("https://")):
-        base = "https://" + base.lstrip("/")
+        return None
     return base.rstrip("/")
 
-if FastAPI:
-    svc = FastAPI(title="LuViNoCryptoBot")
+KEEPALIVE_ENABLE = os.getenv("KEEPALIVE_ENABLE", "0").lower() in ("1", "true", "yes", "on")
 
-    # Healthcheck für Render
-    @svc.get("/", include_in_schema=False)
-    async def _root_ok():
-        return PlainTextResponse("ok", status_code=200)
+WEBHOOK_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "")
+WEBHOOK_PATH = f"/tg/{WEBHOOK_TOKEN}" if WEBHOOK_TOKEN else "/tg/disabled"
 
-    @svc.get("/healthz", include_in_schema=False)
-    async def _healthz():
-        return JSONResponse({
-            "status": "ok",
-            "aw_running": bool(AW_CFG.get("enabled")),
-            "liq_running": bool(LIQ_CFG.get("enabled")),
-        })
+# bot_app wird in build_app() erzeugt – hier nur als globale Referenz
+APP: "Optional[Application]" = None
+AUTOWATCH_TASK: Optional[asyncio.Task] = None
+AUTO_LIQ_TASK:  Optional[asyncio.Task]  = None
 
-    # Webhook-Endpunkt: /tg/<BOT_TOKEN>
-    @svc.post("/tg/{token}")
-    async def telegram_webhook(token: str, request: Request):
-        if token != TELEGRAM_BOT_TOKEN:
-            return PlainTextResponse("forbidden", status_code=403)
-        if APP is None:
-            return PlainTextResponse("app not ready", status_code=503)
-        payload = await request.json()
-        upd = Update.de_json(payload, APP.bot)
-        await APP.update_queue.put(upd)  # an PTB weiterreichen
-        return JSONResponse({"ok": True})
+# --------------------------------------------------------------------
+# FastAPI-App
+# --------------------------------------------------------------------
 
-    # Startup: PTB ohne Polling + Webhook setzen + Loops starten
-    @svc.on_event("startup")
-    async def _on_startup():
-        global APP, AUTOWATCH_TASK, AUTO_LIQ_TASK
+svc = FastAPI(title="LuViNoCryptoBot")
 
-        if APP is None:
-            APP = await build_app()
-            await APP.initialize()
+@svc.get("/", include_in_schema=False)
+async def root() -> PlainTextResponse:
+    # Render schickt gelegentlich HEAD/GET / – wir antworten 200 statt 405
+    return PlainTextResponse("ok", status_code=200)
 
-        # PTB *ohne* Polling starten (nur interner Dispatcher/JobQueue)
-        await APP.start()
+@svc.get("/healthz", include_in_schema=False)
+async def healthz() -> JSONResponse:
+    return JSONResponse({
+        "status": "ok",
+        "aw_running": bool(AW_CFG.get("enabled")),
+        "liq_running": bool(LIQ_CFG.get("enabled"))
+    })
 
-        # Webhook registrieren
-        base = _ext_base_url()
-        if not base:
-            logger.warning(
-                "WEBHOOK_BASE_URL / RENDER_* nicht gesetzt – kein Webhook registriert."
-            )
-        else:
-            hook_url = f"{base}/tg/{TELEGRAM_BOT_TOKEN}"
+@svc.post(WEBHOOK_PATH)
+async def telegram_webhook(req: Request) -> JSONResponse:
+    """
+    Telegram → unser Webhook-Entry. Wir parsen Update und legen es
+    in die PTB-Queue. Keine blockierenden Operationen hier.
+    """
+    global APP
+    if APP is None or not getattr(APP, "running", False):
+        return JSONResponse({"ok": False, "error": "app not ready"}, status_code=503)
+    data = await req.json()
+    upd = Update.de_json(data, APP.bot)  # type: ignore[arg-type]
+    await APP.update_queue.put(upd)
+    return JSONResponse({"ok": True})
+
+# --------------------------------------------------------------------
+# Startup/Shutdown Hooks
+# --------------------------------------------------------------------
+
+async def _start_background_tasks() -> None:
+    """Start optional unsere eigenen Loops im aktuellen Event-Loop."""
+    global AUTOWATCH_TASK, AUTO_LIQ_TASK
+
+    if AW_CFG.get("enabled") and (AUTOWATCH_TASK is None or AUTOWATCH_TASK.done()):
+        AUTOWATCH_TASK = asyncio.create_task(aw_loop(), name="autowatch")
+
+    if LIQ_CFG.get("enabled") and (AUTO_LIQ_TASK is None or AUTO_LIQ_TASK.done()):
+        AUTO_LIQ_TASK = asyncio.create_task(auto_liq_loop(), name="autoliq")
+
+    if KEEPALIVE:
+        asyncio.create_task(_self_keepalive())
+
+async def _self_keepalive() -> None:
+    """Optionale Selbst-Ping-Schleife, falls kein externer Healthcheck läuft."""
+    import httpx
+    base = _ext_base_url()
+    if not base:
+        log.warning("No external base URL for keepalive; skipping.")
+        return
+    url = f"{base}/healthz"
+    async with httpx.AsyncClient(timeout=10) as client:
+        while True:
             try:
-                # evtl. alten Hook löschen (PTB v20/v21 unterscheiden sich bei Signaturen)
-                try:
-                    await APP.bot.delete_webhook(drop_pending_updates=True)
-                except TypeError:
-                    await APP.bot.deleteWebhook(drop_pending_updates=True)
-            except Exception:
-                pass
-            try:
-                try:
-                    await APP.bot.set_webhook(hook_url, drop_pending_updates=True)
-                except TypeError:
-                    await APP.bot.setWebhook(url=hook_url, drop_pending_updates=True)
-                logger.info("Telegram webhook gesetzt: %s", hook_url)
+                await client.get(url)
+                log.debug("keepalive OK -> %s", url)
             except Exception as e:
-                logger.exception("Webhook setzen fehlgeschlagen: %s", e)
+                log.warning("keepalive failed: %s", e)
+            await asyncio.sleep(25)
 
-        # Hintergrund-Loops (optional) starten
-        if AW_CFG.get("enabled") and (AUTOWATCH_TASK is None or AUTOWATCH_TASK.done()):
-            AUTOWATCH_TASK = asyncio.create_task(aw_loop())
-        if LIQ_CFG.get("enabled") and (AUTO_LIQ_TASK is None or AUTO_LIQ_TASK.done()):
-            AUTO_LIQ_TASK = asyncio.create_task(auto_liq_loop())
+@svc.on_event("startup")
+async def on_startup() -> None:
+    """
+    Startet PTB Application im selben Event-Loop wie FastAPI,
+    setzt den Webhook und startet unsere Loops.
+    """
+    global APP
+    if APP is None:
+        # build_app() stammt aus deinem bestehenden Code und erzeugt die PTB-Application
+        APP = await build_app()
+        await APP.initialize()
+        await APP.start()     # WICHTIG: KEIN run_polling() im ASGI-Modus!
 
-    # Shutdown: sauber aufräumen
-    @svc.on_event("shutdown")
-    async def _on_shutdown():
-        await _stop_task("AutoLiquidity", "AUTO_LIQ_TASK")
-        await _stop_task("AutoWatch", "AUTOWATCH_TASK")
+    base = _ext_base_url()
+    if base:
+        hook_url = f"{base}{WEBHOOK_PATH}"
         try:
-            if APP and APP.bot:
-                try:
-                    await APP.bot.delete_webhook(drop_pending_updates=True)
-                except Exception:
-                    pass
-        finally:
-            if APP:
-                try:
-                    await APP.stop()
-                finally:
-                    await APP.shutdown()
+            await APP.bot.delete_webhook(drop_pending_updates=True)
+            await APP.bot.set_webhook(url=hook_url, drop_pending_updates=True)
+            log.info("Telegram webhook set to %s", hook_url)
+        except Exception:
+            log.exception("Failed to set Telegram webhook")
+
+    await _start_background_tasks()
+    log.info("Application startup complete")
+
+@svc.on_event("shutdown")
+async def on_shutdown() -> None:
+    """Sauberes Herunterfahren; Tasks canceln und PTB stoppen."""
+    global APP, AUTOWATCH_TASK, AUTO_LIQ_TASK
+
+    for t in (AUTOWATCH_TASK, AUTO_LIQ_TASK):
+        if t and not t.done():
+            t.cancel()
+            with contextlib.suppress(Exception):
+                await t
+    AUTOWATCH_TASK = None
+    AUTO_LIQ_TASK = None
+
+    if APP:
+        with contextlib.suppress(Exception):
+            await APP.bot.delete_webhook(drop_pending_updates=True)
+            await APP.stop()
+            await APP.shutdown()
+        log.info("PTB application stopped")
