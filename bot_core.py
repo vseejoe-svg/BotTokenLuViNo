@@ -6262,13 +6262,13 @@ async def run_with_reconnect():
         POLLING_STARTED = False
 
 
-# ==== ASGI Server (FastAPI) – stabiler Render-/Webhook-Mode ====
+# ==== ASGI Server (FastAPI) – Render/Webhook stabil ====
+import os, asyncio, contextlib
 from fastapi import FastAPI, Request
 from fastapi.responses import PlainTextResponse, JSONResponse
 from telegram import Update
-import contextlib
 
-# --- Basis-URL für Webhook (ENV) ---
+# ---- öffentliche Basis-URL für den Webhook ----
 def _ext_base_url() -> str:
     base = (
         os.getenv("WEBHOOK_BASE_URL")
@@ -6282,7 +6282,7 @@ def _ext_base_url() -> str:
         base = "https://" + base
     return base.rstrip("/")
 
-WEBHOOK_TOKEN_PATH = f"/tg/{TELEGRAM_BOT_TOKEN}"   # z.B. /tg/<bot-token>
+WEBHOOK_TOKEN_PATH = f"/tg/{TELEGRAM_BOT_TOKEN}"   # /tg/<bot-token>
 
 svc = FastAPI(title="LuViNoCryptoBot")
 
@@ -6295,22 +6295,22 @@ async def _healthz():
     return JSONResponse({
         "status": "ok",
         "aw_running": bool(AW_CFG.get("enabled")),
-        "liq_running": bool(LIQ_CFG.get("enabled"))
+        "liq_running": bool(LIQ_CFG.get("enabled")),
     })
 
-# Telegram schickt Updates auf /tg/<token>
+# Telegram liefert Updates auf /tg/<token>
 @svc.post(WEBHOOK_TOKEN_PATH)
 async def telegram_webhook(req: Request):
-    # Sicherheitscheck (nur falls jemand den Pfad faked)
+    # extra Schutz, falls der Pfad „gefaked“ wird
     if not str(req.url.path).endswith(TELEGRAM_BOT_TOKEN):
         return PlainTextResponse("forbidden", status_code=403)
 
     if APP is None:
         return PlainTextResponse("app not ready", status_code=503)
 
-    data = await req.json()
-    update = Update.de_json(data, APP.bot)
-    # PTB braucht die Updates über process_update
+    payload = await req.json()
+    update = Update.de_json(payload, APP.bot)
+    # Python-Telegram-Bot v20: direkt verarbeiten
     await APP.process_update(update)
     return PlainTextResponse("ok", status_code=200)
 
@@ -6318,41 +6318,39 @@ async def telegram_webhook(req: Request):
 async def _on_startup():
     """
     - PTB-App bauen/initialisieren/starten (ohne Polling)
-    - Telegram Webhook auf unseren ASGI-Endpunkt setzen
-    - Hintergrund-Loops (AW/LIQ/Keepalive) sauber als Tasks starten
+    - Telegram Webhook auf unseren ASGI-Endpunkt setzen (Pending Updates behalten)
+    - Hintergrund-Loops (AW/LIQ) starten
     """
     global APP, AUTOWATCH_TASK, AUTO_LIQ_TASK
 
-    # 1) PTB-App sicherstellen
     if APP is None:
         APP = await build_app()
         await APP.initialize()
 
-    # 2) PTB intern starten (JobQueue etc.). KEIN Polling!
-    await APP.start()
+    await APP.start()  # JobQueue etc.; kein Polling!
 
-    # 3) Webhook setzen
     base = _ext_base_url()
     if not base:
         logger.warning(
             "WEBHOOK_BASE_URL/RENDER_EXTERNAL_URL/RENDER_EXTERNAL_HOSTNAME fehlt – "
-            "Telegram-Kommandos kommen nicht an."
+            "keine Telegram-Kommandos per Webhook."
         )
     else:
         hook_url = f"{base}{WEBHOOK_TOKEN_PATH}"
         try:
-            # altes Ziel löschen & neues setzen
-            await APP.bot.delete_webhook(drop_pending_updates=True)
+            # WICHTIG: keine Pending-Updates verwerfen!
             await APP.bot.set_webhook(
                 hook_url,
+                max_connections=40,
                 allowed_updates=["message", "callback_query"]
             )
             logger.info("Telegram webhook gesetzt: %s", hook_url)
         except Exception as e:
             logger.exception("Webhook setzen fehlgeschlagen: %s", e)
 
-    # 4) Hintergrund-Tasks starten
+    # BG-Tasks sauber tracken
     svc.state.bg_tasks = []
+
     if AW_CFG.get("enabled") and (AUTOWATCH_TASK is None or AUTOWATCH_TASK.done()):
         AUTOWATCH_TASK = asyncio.create_task(aw_loop())
         svc.state.bg_tasks.append(AUTOWATCH_TASK)
@@ -6361,23 +6359,15 @@ async def _on_startup():
         AUTO_LIQ_TASK = asyncio.create_task(auto_liq_loop())
         svc.state.bg_tasks.append(AUTO_LIQ_TASK)
 
-    if KEEPALIVE_ENABLE:
-        svc.state.bg_tasks.append(asyncio.create_task(start_render_self_ping(300)))
-
 @svc.on_event("shutdown")
 async def _on_shutdown():
-    # BG-Tasks beenden (best effort)
+    # BG-Tasks herunterfahren
     for t in getattr(svc.state, "bg_tasks", []):
         t.cancel()
         with contextlib.suppress(asyncio.CancelledError):
             await t
 
-    # Webhook entfernen & PTB stoppen
-    try:
-        await APP.bot.delete_webhook(drop_pending_updates=True)  # <-- korrekt geschrieben!
-    except Exception:
-        pass
-
+    # WICHTIG: Webhook NICHT löschen -> Telegram puffert während Sleep!
     if APP:
         with contextlib.suppress(Exception):
             await APP.stop()
