@@ -6352,7 +6352,7 @@ async def _start_background_tasks() -> None:
     if LIQ_CFG.get("enabled") and (AUTO_LIQ_TASK is None or AUTO_LIQ_TASK.done()):
         AUTO_LIQ_TASK = asyncio.create_task(auto_liq_loop(), name="autoliq")
 
-    if KEEPALIVE:
+    if KEEPALIVE_ENABLE:
         asyncio.create_task(_self_keepalive())
 
 async def _self_keepalive() -> None:
