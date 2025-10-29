@@ -6370,7 +6370,7 @@ async def on_shutdown():
 
     # Webhook entfernen und PTB stoppen
     try:
-        await APP.bot.delete_w ebhook(drop_pending_updates=True)
+        await APP.bot.delete_webhook(drop_pending_updates=True)
     except Exception:
         pass
     if APP:
