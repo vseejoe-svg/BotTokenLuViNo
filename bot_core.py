@@ -6298,43 +6298,62 @@ if FastAPI:
         await APP.update_queue.put(update)
         return {"ok": True}
 
+        # ==== ASGI-Server (Startup) – KORRIGIERT ====
     @svc.on_event("startup")
     async def _on_startup():
+        """
+        - PTB bauen/initialisieren/STARTEN (ohne Polling)
+        - Telegram Webhook auf unseren FastAPI-Endpoint setzen
+        - Background-Loops (AW/LIQ) starten, falls enabled
+        """
         global APP, AUTOWATCH_TASK, AUTO_LIQ_TASK
+    
+        # 1) PTB-App sicherstellen
         if APP is None:
             APP = await build_app()
             await APP.initialize()
-            # PTB in webhook-mode nicht mit .run_polling(), sondern nur .start()!
-            await APP.start()
-
-        # Telegram Webhook setzen, wenn URL vorhanden
-        if WEBHOOK_URL:
+    
+        # 2) PTB intern starten (JobQueue etc.). KEIN Polling hier!
+        await APP.start()
+    
+        # 3) Webhook-URL bestimmen und setzen
+        base = _ext_base_url()  # KEIN Walrus-Operator
+        if not base:
+            logger.warning(
+                "WEBHOOK_BASE_URL/RENDER_EXTERNAL_URL/RENDER_EXTERNAL_HOSTNAME nicht gesetzt – "
+                "Telegram-Kommandos werden NICHT zugestellt!"
+            )
+        else:
+            hook_url = f"{base}/tg/{TELEGRAM_BOT_TOKEN}"
             try:
-                await APP.bot.set_webhook(url=WEBHOOK_URL)
-                logger.info("Telegram webhook set: %s", WEBHOOK_URL)
+                # altes Ziel löschen und neues Ziel setzen
+                await APP.bot.delete_webhook(drop_pending_updates=True)
+                await APP.bot.set_webhook(hook_url, drop_pending_updates=True)
+                logger.info("Telegram webhook gesetzt: %s", hook_url)
             except Exception as e:
-                logger.exception("Failed to set webhook: %s", e)
-
-        # Hintergrund-Loops anschieben (sofort beim Start)
-        if AW_CFG.get("enabled") und globals().get("AUTOWATCH_TASK") ist None:
-            globals()["AUTOWATCH_TASK"] = asyncio.create_task(aw_loop())
-        if LIQ_CFG.get("enabled") and (globals().get("AUTO_LIQ_TASK") is None):
+                logger.exception("Webhook setzen fehlgeschlagen: %s", e)
+    
+        # 4) Background-Loops starten (sauber ohne Walrus)
+        if AW_CFG.get("enabled") and (AUTOWATCH_TASK is None or AUTOWATCH_TASK.done()):
+            AUTOWATCH_TASK = asyncio.create_task(aw_loop())
+        if LIQ_CFG.get("enabled") and (AUTO_LIQ_TASK is None or AUTO_LIQ_TASK.done()):
             AUTO_LIQ_TASK = asyncio.create_task(auto_liq_loop())
-
+    
+    
     @svc.on_event("shutdown")
     async def _on_shutdown():
-        global AUTOWATCH_TASK, AUTO_LIQ_TASK
-        if AUTOWATCH_TASK and not AUTOWATCH_TASK.done():
-            AUTOWATCH_TASK.cancel()
-            try:
-                await AUTOWATCH_TASK
-            except Exception:
-                pass
-        if AUTO_LIQ_TASK and not AUTO_LIQ_TASK.done():
-            AUTO_LIQ_TASK.cancel()
-            try:
-                await AUTO_LIQ_TASK
-            except Exception:
-                pass
+        # Loops stoppen
+        await _stop_task("AutoLiquidity", "AUTO_LIQ_TASK")
+        await _stop_task("AutoWatch", "AUTOWATCH_TASK")
+    
+        # Webhook entfernen und PTB sauber stoppen
+        try:
+            await APP.bot.delete_webhook(drop_pending_updates=True)
+        except Exception:
+            pass
         if APP:
+            try:
+                await APP.stop()
+            except Exception:
+                pass
             await APP.shutdown()
