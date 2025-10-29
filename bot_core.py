@@ -1,4 +1,4 @@
-# autobot_v163_full.py
+# bot_core.py
 # -----------------------------------------------------------
 # Telegram-Trading-Bot für Solana:
 # - Integrierte Strategie SwingBot v1.6.3 (5s)
@@ -7,7 +7,6 @@
 # - Multi-Mint-Rolling + eigene 5s-Candles + Debug-Visualisierung
 # - Integriertes Modul "INDICATORS & IO" (IndiState + Debug-Formatter)
 # -----------------------------------------------------------
-
 from __future__ import annotations
 import os, json, time, base64, asyncio, logging, csv, random, io
 from dataclasses import dataclass, field
@@ -41,7 +40,6 @@ from telegram.constants import ParseMode
 import asyncio, os  # <-- falls oben noch nicht vorhanden
 import contextlib
 
-
 # Minimaler HTTP-Server für Render-Healthcheck (hält die Instanz wach)
 async def start_keepalive_server():
     port = int(os.environ.get("PORT", "10000"))
@@ -72,9 +70,6 @@ async def start_keepalive_server():
         await server.serve_forever()
 
 # ===============================================================================
-
-
-# =========================
 # ENV / Konfiguration
 # =========================
 def _need(name: str) -> str:
@@ -98,13 +93,13 @@ if not HELIUS_API_KEY:
             HELIUS_API_KEY = q["api-key"][0]
     except Exception:
         pass
-#========================================================
+# ===============================================================================
 # Globale Task-Handles (nur Background-Loops; KEIN Polling!)
 APP = None
 AUTO_TASK: asyncio.Task | None = None          # z.B. dein auto_loop
 AUTOWATCH_TASK: asyncio.Task | None = None     # z.B. dein autowatch_loop
 AUTO_LIQ_TASK: asyncio.Task | None = None      # z.B. dein auto_liquidity_loop
-#========================================================
+# ===============================================================================
 # ===== PAPER MODE (aus ENV, mit Defaults) =====
 PAPER_MODE    = os.environ.get("PAPER_MODE", "0").strip().lower() in ("1", "true", "yes", "on")
 PAPER_FEE_BPS = float(os.environ.get("PAPER_FEE_BPS", "10"))  # 20 bps = 0.20 %
