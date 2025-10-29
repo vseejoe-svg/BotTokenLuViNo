@@ -6316,7 +6316,7 @@ if FastAPI:
                 logger.exception("Failed to set webhook: %s", e)
 
         # Hintergrund-Loops anschieben (sofort beim Start)
-        if AW_CFG.get("enabled") and (AUTOWATCH BEEN := globals().get("AUTOWATCH_TASK")) is None:
+        if AW_CFG.get("enabled") and (AUTOWATCH_TASK = globals().get("AUTOWATCH_TASK")) is None:
             AUTOWATCH_TASK = asyncio.create_task(aw_loop())
         if LIQ_CFG.get("enabled") and (globals().get("AUTO_LIQ_TASK") is None):
             AUTO_LIQ_TASK = asyncio.create_task(auto_liq_loop())
