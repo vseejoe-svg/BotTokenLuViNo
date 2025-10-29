@@ -99,8 +99,6 @@ if not HELIUS_API_KEY:
     except Exception:
         pass
 #========================================================
-#iÄNDERUNGEN ANPASSUNG WEGEN RENDER
-import asyncio
 # Globale Task-Handles (nur Background-Loops; KEIN Polling!)
 APP = None
 AUTO_TASK: asyncio.Task | None = None          # z.B. dein auto_loop
@@ -6381,14 +6379,4 @@ if FastAPI:
             except Exception:
                 pass
             await APP.shutdown()
-
-    # Optionaler Telegram-WebHook-Endpoint (nur falls du mit WebHook statt /boot+polling arbeitest)
-    # @svc.post("/tg/{token}")
-    # async def telegram_webhook(token: str, request: Request):
-    #     if token != TELEGRAM_BOT_TOKEN:
-    #         return PlainTextResponse("forbidden", status_code=403)
-    #     data = await request.json()
-    #     update = Update.de_json(data, APP.bot)
-    #     await APP.process_update(update)
-    #     return JSONResponse({"ok": True})
 
