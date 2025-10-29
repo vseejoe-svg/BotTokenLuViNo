@@ -6298,7 +6298,7 @@ if FastAPI:
         await APP.update_queue.put(update)
         return {"ok": True}
 
-        # ==== ASGI-Server (Startup) – KORRIGIERT ====
+    # ==== ASGI-Server (Startup) – KORRIGIERT ====
     @svc.on_event("startup")
     async def _on_startup():
         """
