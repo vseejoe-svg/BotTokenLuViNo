@@ -6314,6 +6314,7 @@ async def telegram_webhook(req: Request):
     return PlainTextResponse("ok", status_code=200)
 
 # --- Startup / Shutdown ---
+
 @svc.on_event("startup")
 async def on_startup():
     global APP, AUTOWATCH_TASK, AUTO_LIQ_TASK
@@ -6341,6 +6342,9 @@ async def on_startup():
         logger.warning("Keine externe Basis-URL gefunden – Webhook wird nicht gesetzt")
 
     # Hintergrund-Tasks robust starten (Fehler loggen, aber Prozess nicht killen)
+    if not hasattr(svc.state, "bg_tasks"):
+        svc.state.bg_tasks = []
+
     def _guarded(coro, name):
         async def runner():
             try:
@@ -6352,23 +6356,32 @@ async def on_startup():
         t = asyncio.create_task(runner(), name=name)
         svc.state.bg_tasks.append(t)
 
+    # >>> WICHTIG: Trading-Loop (Signale/Trades) immer starten
+    _guarded(auto_loop(APP), "auto_loop")
+
+    # Auto-Watchlist (optional per ENV enabled)
     if AW_CFG.get("enabled"):
         if AUTOWATCH_TASK is None or AUTOWATCH_TASK.done():
             _guarded(aw_loop(), "aw_loop")
 
+    # Auto-Liquidity (optional per ENV enabled)
     if LIQ_CFG.get("enabled"):
         if AUTO_LIQ_TASK is None or AUTO_LIQ_TASK.done():
             _guarded(auto_liq_loop(), "auto_liq_loop")
 
-    # Keepalive für Free-Plan ausschalten; Starter/Pro brauchen das nicht
-    if os.getenv("KEEPALIVE_ENABLE", "0").lower() in ("1","true","yes","on"):
+    # Keepalive (nur wenn explizit aktiviert; Starter/Pro brauchen das nicht)
+    if os.getenv("KEEPALIVE_ENABLE", "0").lower() in ("1", "true", "yes", "on"):
         _guarded(start_render_self_ping(300), "self_ping")
 
     # nützliche Signal-Logs (nur zum Debuggen)
-    loop = asyncio.get_running_loop()
-    for s in (signal.SIGTERM, signal.SIGINT):
-        with contextlib.suppress(NotImplementedError):
-            loop.add_signal_handler(s, lambda s=s: logger.warning("Received %s", s.name))
+    try:
+        loop = asyncio.get_running_loop()
+        for s in (signal.SIGTERM, signal.SIGINT):
+            with contextlib.suppress(NotImplementedError):
+                loop.add_signal_handler(s, lambda s=s: logger.warning("Received %s", s.name))
+    except Exception:
+        pass
+
 
 @svc.on_event("shutdown")
 async def on_shutdown():
