@@ -6342,10 +6342,10 @@ async def on_startup():
             logger.warning("set_my_commands failed: %s", e)
 
         # Register webhook pointing to /tg/<token>
-        if not WEBHOOK_BASEURL := WEBHOOK_BASE_URL:
+        if not WEBHOOK_BASE_URL := WEBHOOK_BASE_URL:
             logger.warning("WEBHOOK_BASE_URL not set – webhook cannot be configured")
         else:
-            wh_url = f"{WEBHOOK_BASEURL}/tg/{TELEGRAM_BOT_TOKEN}"
+            wh_url = f"{WEBHOOK_BASE_URL}/tg/{TELEGRAM_BOT_TOKEN}"
             try:
                 await app.bot.delete_webhook(drop_pending_updates=True)
             except Exception:
