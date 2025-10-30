@@ -3008,7 +3008,8 @@ CONFIG_1M = Config(
     pause_after_losses=3,
     pause_minutes=12,
     max_trades_per_hour=8,
-    allowed_hours_csv="2,3,4,5,10,11,12,13,14,15,16,23",
+    #allowed_hours_csv="2,3,4,5,10,11,12,13,14,15,16,23",
+    allowed_hours_csv="",
 )
 
 # =========================
