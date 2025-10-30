@@ -2561,20 +2561,31 @@ async def sell_all(mint: str) -> dict:
 #=================================================================================================
 
 async def cmd_pnl(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """
+    P&L mit Realized/Unrealized + Trades-Stats (Day/Week/Total) und
+    Max-Drawdown je Zeitraum. Belegt außerdem die CSV als Dokument.
+    """
     if not guard(update):
         return
 
     rows = _load_trades_csv()
 
-    # UTC-Grenzen für Day/Week
+    # --- Zeitfenster (UTC) ---
     now = time.time()
     dt_now = dt.datetime.now(UTC)
     dt_day0 = dt.datetime(dt_now.year, dt_now.month, dt_now.day, tzinfo=UTC)
     ts_day0 = int(dt_day0.timestamp())
     ts_week = int(now - 7 * 86400)
 
-    def _sum_realized(rows: list, ts_from: int | None) -> Decimal:
-        s = Decimal("0")
+    # ---- Helfer: Realized & Max-Drawdown eines Zeitfensters ----
+    def _realized_and_maxdd(rows: list, ts_from: int | None) -> tuple[float, float, int, int]:
+        """
+        returns (realized_sum, max_drawdown, n_trades, n_tokens)
+        - zählt nur SELL/PAPER-SELL-Zeilen (Executions)
+        - DD via kumulierte Realized-Equity
+        """
+        # Filter nur SELL-Zeilen ab ts_from
+        exec_rows = []
         for r in rows:
             side = (r.get("side") or "").upper()
             if "SELL" not in side:
@@ -2585,25 +2596,40 @@ async def cmd_pnl(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 ts = 0
             if ts_from is not None and ts < ts_from:
                 continue
-            s += _realized_from_row(r)
-        return s
+            exec_rows.append(r)
 
-    d = _sum_realized(rows, ts_day0)
-    w = _sum_realized(rows, ts_week)
-    t = _sum_realized(rows, None)
+        # Sum Realized
+        realized_sum = Decimal("0")
+        for r in exec_rows:
+            realized_sum += _realized_from_row(r)
 
-    q2 = lambda x: float(Decimal(str(x)).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP))
-    realized_day, realized_week, realized_total = map(q2, (d, w, t))
+        # Max Drawdown der kumulierten Realized-Equity
+        eq = Decimal("0")
+        peak = Decimal("0")
+        max_dd = Decimal("0")
+        # chronologisch
+        exec_rows.sort(key=lambda x: int(x.get("ts") or 0))
+        for r in exec_rows:
+            eq += _realized_from_row(r)
+            if eq > peak:
+                peak = eq
+            dd = peak - eq
+            if dd > max_dd:
+                max_dd = dd
 
-    # Trades & Hit-Rate (nur SELL-Executions)
-    sell_rows = [r for r in rows if "SELL" in (r.get("side") or "").upper()]
-    num_trades = len(sell_rows)
-    wins = sum(1 for r in sell_rows if _realized_from_row(r) > 0)
-    losses = sum(1 for r in sell_rows if _realized_from_row(r) < 0)
-    neutrals = num_trades - wins - losses
-    hit_rate = (wins / (wins + losses) * 100.0) if (wins + losses) > 0 else 0.0
+        # Trades & Tokens
+        n_trades = len(exec_rows)
+        n_tokens = len({(r.get("mint") or "").strip() for r in exec_rows if (r.get("mint") or "").strip()})
 
-    # Chart
+        q2 = lambda x: float(Decimal(str(x)).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP))
+        return q2(realized_sum), q2(max_dd), n_trades, n_tokens
+
+    # --- Day / Week / Total ---
+    realized_day,  dd_day,  trades_day,  tokens_day  = _realized_and_maxdd(rows, ts_day0)
+    realized_week, dd_week, trades_week, tokens_week = _realized_and_maxdd(rows, ts_week)
+    realized_total, dd_total, trades_total, tokens_total = _realized_and_maxdd(rows, None)
+
+    # --- Balkendiagramm (Realized) ---
     labels = ["Day", "Week", "Total"]
     values = [realized_day, realized_week, realized_total]
     fig, ax = plt.subplots(figsize=(6.6, 3.2), dpi=160)
@@ -2617,34 +2643,40 @@ async def cmd_pnl(update: Update, context: ContextTypes.DEFAULT_TYPE):
     fig.savefig(buf, format="png")
     plt.close(fig)
     buf.seek(0)
-
     try:
         await update.effective_chat.send_photo(photo=buf, caption="📈 PnL – Day/Week/Total")
     except Exception:
         pass
 
-    # Unrealized + offene Positionen
+    # --- Unrealized + offene Positionen (wie gehabt) ---
     unrealized_total, _rows_unreal = total_unreal_pnl()
 
+    # --- Ausgabe-Text (logisch getrennt nach PnL und Drawdown) ---
     lines = [
-        "📈 P&L",
-        f"Realized (Day):   {realized_day:+,.2f} USD",
-        f"Realized (Week):  {realized_week:+,.2f} USD",
-        f"Realized (Total): {realized_total:+,.2f} USD",
-        f"Unrealized (Open): {unrealized_total:+,.2f} USD",
+        "📊 <b>P&L – Übersicht</b>",
         "",
-        f"Trades (executions): {num_trades} | Wins: {wins} | Losses: {losses} | Flat: {neutrals} | Hit‑Rate: {hit_rate:.1f}%",
+        "💰 <b>Realized</b>",
+        f"• Day:   {realized_day:+,.2f} USD   (Trades: {trades_day},  Tokens: {tokens_day})",
+        f"• Week:  {realized_week:+,.2f} USD  (Trades: {trades_week}, Tokens: {tokens_week})",
+        f"• Total: {realized_total:+,.2f} USD  (Trades: {trades_total}, Tokens: {tokens_total})",
+        f"• Unrealized (Open): {unrealized_total:+,.2f} USD",
+        "",
+        "📉 <b>Max Drawdown</b>",
+        f"• Day:   {(-dd_day):+,.2f} USD",
+        f"• Week:  {(-dd_week):+,.2f} USD",
+        f"• Total: {(-dd_total):+,.2f} USD",
     ]
-    await send(update, "\n".join(lines))
 
-    # CSV beilegen
+    await update.effective_chat.send_message("\n".join(lines), parse_mode=ParseMode.HTML)
+
+    # CSV anhängen (optional)
     if os.path.exists(PNL_CSV):
         try:
             with open(PNL_CSV, "rb") as f:
                 await update.effective_chat.send_document(
                     document=f,
                     filename=os.path.basename(PNL_CSV),
-                    caption="📄 Trades/PNL-CSV (v2)"
+                    caption="📄 Auto_Trade_Bot/PNL-CSV (SOL chain)"
                 )
         except Exception:
             pass
@@ -3522,41 +3554,53 @@ def format_debug_line(mint: str, dbg: Dict[str, float], lookback_secs: int) -> s
 #===============================================================================
     
 async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """
+    Start/Help: zeigt Schnellbefehle + vollständige Befehlsübersicht,
+    passend zu den in build_app() registrierten Commands.
+    """
     if not guard(update):
         return
+
     helius_txt = "Helius" if is_helius_url(RPC_URL) else "Custom RPC"
+
+    quick = " /dashboard  •  /pnl  •  /open_trades  •  /list_watch  •  /aw_status  •  /check_liq USDC "
+    wl = ", ".join(WATCHLIST) or "-"
+
     lines = [
-        f"🤖 <b>SwingBot v1.6.3 online</b>",
+        f"🤖 <b>Auto-Trade-BOT with Autowach for SOL chain</b>",
         f"Wallet: <code>{WALLET_PUBKEY}</code>",
         f"RPC: <code>{RPC_URL}</code> ({helius_txt})",
-        f"Watchlist: {', '.join(WATCHLIST) or '-'}",
+        f"Watchlist: {wl}",
+        "",
+        f"⚡ <b>Schnellbefehle</b>:<code>{quick}</code>",
         "",
         "— <b>Core</b>",
         "<code>/boot</code> / <code>/shutdown</code> – Bot an/aus, <code>/diag_webhook</code>",
-        "<code>/status</code>, <code>/health</code>, <code>/diag</code>, <code>/set_proxy &lt;url|off&gt;</code>",
+        "<code>/status</code>, <code>/health</code>, <code>/diag</code>, <code>/dashboard</code>",
+        "<code>/debug on|off</code>, <code>/set_proxy &lt;url|off&gt;</code>",
         "",
         "— <b>Trading</b>",
         "<code>/buy &lt;MINT&gt; [sol]</code>, <code>/sell_all &lt;MINT&gt;</code>",
         "<code>/set_notional &lt;sol&gt;</code>, <code>/set_slippage &lt;pct&gt;</code>, <code>/set_fee &lt;SOL&gt;</code>",
-        "<code>/positions</code>, <code>/open_trades</code>",
+        "<code>/positions</code>, <code>/open_trades</code>, <code>/pnl</code>",
+        "<code>/chart &lt;MINT&gt; [bars]</code>",
         "",
         "— <b>Discovery &amp; Sanity</b>",
         "<code>/scan_ds</code> [Flags], <code>/sanity &lt;MINT&gt;</code>",
         "<code>/dsdiag</code>, <code>/dsraw</code>, <code>/ds_trending</code>, <code>/trending</code> [n [focus] [quote]]",
         "",
         "— <b>Auto-Watchlist</b>",
-        "<code>/autowatch on|off</code>, <code>/aw_status</code>, <code>/aw_config</code> [Flags], <code>/aw_now</code>",
+        "<code>/autowatch on|off</code>, <code>/aw_status</code>, <code>/aw_config</code> [Flags], <code>/aw_now</code>, <code>/aw_observe</code>",
         "",
         "— <b>Watchlist</b>",
         "<code>/list_watch</code>, <code>/add_watch &lt;MINT&gt;</code>, <code>/remove_watch &lt;MINT&gt;</code>",
         "",
-        "— <b>Charts &amp; P&amp;L</b>",
-        "<code>/chart &lt;MINT&gt; [bars]</code>, <code>/pnl</code>, <code>/debug on|off</code>",
-        "",
         "— <b>Liquidity</b>",
-        "<code>/check_liq &lt;MINT&gt;</code>, <code>/auto_liq on|off</code>, <code>/liq_config</code> [Flags]",
+        "<code>/check_liq &lt;MINT&gt;</code>, <code>/auto_liq on|off</code>, <code>/liq_config</code> [Flags], <code>/check_liq_onchain &lt;MINT&gt;</code>",
     ]
-    await update.message.reply_text("\n".join(lines), parse_mode=ParseMode.HTML)    
+
+    await update.message.reply_text("\n".join(lines), parse_mode=ParseMode.HTML)
+
 #===============================================================================
     
 async def cmd_sanity(update: Update, context: ContextTypes.DEFAULT_TYPE):
