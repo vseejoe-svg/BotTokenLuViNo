@@ -2710,18 +2710,6 @@ async def cmd_pnl(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     await update.effective_chat.send_message("\n".join(lines), parse_mode=ParseMode.HTML)
 
-    # CSV anhängen
-    if os.path.exists(PNL_CSV):
-        try:
-            with open(PNL_CSV, "rb") as f:
-                await update.effective_chat.send_document(
-                    document=f,
-                    filename=os.path.basename(PNL_CSV),
-                    caption="📄 Trades/PNL-CSV (v2)"
-                )
-        except Exception:
-            pass
-
     # CSV anhängen (optional)
     if os.path.exists(PNL_CSV):
         try:
