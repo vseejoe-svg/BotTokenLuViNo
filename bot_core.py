@@ -19,6 +19,7 @@ import requests
 from urllib.parse import urlparse, parse_qs
 import re  # neu: für Solana-Adressprüfung
 from telegram.ext import Application, CommandHandler, ContextTypes, CallbackQueryHandler
+import time
 
 # Matplotlib (headless) für Debug-Charts
 import matplotlib
@@ -36,6 +37,8 @@ from solders.signature import Signature as Sig
 
 from telegram import InlineKeyboardMarkup, InlineKeyboardButton
 from telegram.constants import ParseMode
+from telegram.ext import CallbackQueryHandler
+
 # ===============================================================================
 import asyncio, os  # <-- falls oben noch nicht vorhanden
 import contextlib
@@ -2558,172 +2561,450 @@ async def sell_all(mint: str) -> dict:
     )
     return {"sig": sig, "status": status, "res": send_res, "realized_usd": realized}
 
-#=================================================================================================
+#====================================== START PNL ===========================================================
+# =========================
+# PNL MODULE (Drop-in)
+# =========================
+import os, csv, time, glob, tempfile, zipfile, datetime as dt
+from decimal import Decimal, ROUND_HALF_UP
 
-async def cmd_pnl(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """
-    P&L mit:
-      • Realized (Day/Week/Total) + Token-Anzahl
-      • Max Drawdown (Day/Week/Total)
-      • Trade-Statistik (Day/Week/Total): Trades, Wins, Losses, Flat, Hit-Rate
-      • Unrealized (Open)
-      • kleines Balkendiagramm (Realized Day/Week/Total)
-    """
-    if not guard(update):
-        return
+# ---- Pfad zur CSV absolut (via ENV überschreibbar)
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+PNL_CSV  = os.environ.get("PNL_CSV", os.path.join(BASE_DIR, "trades_log.csv"))
 
-    rows = _load_trades_csv()
-
-    # --- Zeitfenster (UTC) ---
-    now = time.time()
-    dt_now = dt.datetime.now(UTC)
-    dt_day0 = dt.datetime(dt_now.year, dt_now.month, dt_now.day, tzinfo=UTC)
-    ts_day0 = int(dt_day0.timestamp())
-    ts_week = int(now - 7 * 86400)
-
-    # ---- Helfer: Stats für ein Zeitfenster ----
-    def _stats_window(rows: list, ts_from: int | None):
-        """
-        returns:
-          realized_sum_f, max_dd_f, n_trades, n_tokens, wins, losses, flats, hit_rate_f
-        - berücksichtigt nur SELL-/PAPER-SELL-Zeilen (Executions)
-        - DD via kumulierter Realized-Equity (chronologische SELLs)
-        - Hit-Rate: Wins / (Wins + Losses) in %
-        """
-        # Executions filtern
-        exec_rows = []
-        for r in rows:
-            side = (r.get("side") or "").upper()
-            if "SELL" not in side:
-                continue
-            try:
-                ts = int(r.get("ts") or 0)
-            except Exception:
-                ts = 0
-            if ts_from is not None and ts < ts_from:
-                continue
-            exec_rows.append(r)
-
-        # Summen / Zähler
-        realized_sum = Decimal("0")
-        wins = 0
-        losses = 0
-        flats = 0
-        tokens = set()
-
-        # für DD: kumulierte Equity (nur SELLs), chronologisch
-        exec_rows.sort(key=lambda x: int(x.get("ts") or 0))
-        eq = Decimal("0")
-        peak = Decimal("0")
-        max_dd = Decimal("0")
-
-        for r in exec_rows:
-            # Token-Set
-            mint = (r.get("mint") or "").strip()
-            if mint:
-                tokens.add(mint)
-
-            # realized dieses Trades
-            realized = _realized_from_row(r)
-            realized_sum += realized
-
-            # Wins/Losses/Flat
-            if realized > 0:
-                wins += 1
-            elif realized < 0:
-                losses += 1
-            else:
-                flats += 1
-
-            # Drawdown-Tracking
-            eq += realized
-            if eq > peak:
-                peak = eq
-            dd = peak - eq
-            if dd > max_dd:
-                max_dd = dd
-
-        n_trades = len(exec_rows)
-        n_tokens = len(tokens)
-        denom = wins + losses
-        hit_rate = (wins / denom * 100.0) if denom > 0 else 0.0
-
-        q2 = lambda x: float(Decimal(str(x)).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP))
-        return (
-            q2(realized_sum),
-            q2(max_dd),
-            n_trades,
-            n_tokens,
-            wins,
-            losses,
-            flats,
-            q2(hit_rate),
-        )
-
-    # --- Day / Week / Total ---
-    (realized_day,  dd_day,  trades_day,  tokens_day,  wins_day,  losses_day,  flats_day,  hit_day)  = _stats_window(rows, ts_day0)
-    (realized_week, dd_week, trades_week, tokens_week, wins_week, losses_week, flats_week, hit_week) = _stats_window(rows, ts_week)
-    (realized_total,dd_total,trades_total,tokens_total,wins_total,losses_total,flats_total,hit_total) = _stats_window(rows, None)
-
-    # --- Balkendiagramm (Realized) ---
-    labels = ["Day", "Week", "Total"]
-    values = [realized_day, realized_week, realized_total]
-    fig, ax = plt.subplots(figsize=(6.6, 3.2), dpi=160)
-    ax.bar(labels, values)
-    ax.set_title("Realized PnL")
-    ax.set_ylabel("USD")
-    for i, v in enumerate(values):
-        ax.text(i, v, f"{v:+,.2f}", ha="center", va="bottom", fontsize=9)
-    buf = io.BytesIO()
-    plt.tight_layout()
-    fig.savefig(buf, format="png")
-    plt.close(fig)
-    buf.seek(0)
+# ---- Utilities
+def _d(x, default="0"):
+    """robust nach Decimal parsen"""
     try:
-        await update.effective_chat.send_photo(photo=buf, caption="📈 PnL – Day/Week/Total")
+        s = str(x).strip()
+        if not s or s.lower() == "none":
+            return Decimal(default)
+        return Decimal(s.replace(",", ""))
     except Exception:
-        pass
-
-    # --- Unrealized + offene Positionen ---
-    unrealized_total, _rows_unreal = total_unreal_pnl()
-
-    # --- Ausgabe-Text ---
-    lines = [
-        "📊 <b>P&L – Übersicht</b>",
-        "",
-        "💰 <b>Realized</b>",
-        f"• Day:   {realized_day:+,.2f} USD   (Tokens: {tokens_day})",
-        f"• Week:  {realized_week:+,.2f} USD  (Tokens: {tokens_week})",
-        f"• Total: {realized_total:+,.2f} USD  (Tokens: {tokens_total})",
-        f"• Unrealized (Open): {unrealized_total:+,.2f} USD",
-        "",
-        "📉 <b>Max Drawdown</b>",
-        f"• Day:   {(-dd_day):+,.2f} USD",
-        f"• Week:  {(-dd_week):+,.2f} USD",
-        f"• Total: {(-dd_total):+,.2f} USD",
-        "",
-        "📈 <b>Trade-Stats</b>",
-        f"• Day:   Trades (executions): {trades_day} | Wins: {wins_day} | Losses: {losses_day} | Flat: {flats_day} | Hit-Rate: {hit_day:.1f}%",
-        f"• Week:  Trades (executions): {trades_week} | Wins: {wins_week} | Losses: {losses_week} | Flat: {flats_week} | Hit-Rate: {hit_week:.1f}%",
-        f"• Total: Trades (executions): {trades_total} | Wins: {wins_total} | Losses: {losses_total} | Flat: {flats_total} | Hit-Rate: {hit_total:.1f}%",
-    ]
-
-    await update.effective_chat.send_message("\n".join(lines), parse_mode=ParseMode.HTML)
-
-    # CSV anhängen (optional)
-    if os.path.exists(PNL_CSV):
         try:
-            with open(PNL_CSV, "rb") as f:
-                await update.effective_chat.send_document(
-                    document=f,
-                    filename=os.path.basename(PNL_CSV),
-                    caption="📄 Auto_Trade_Bot/PNL-CSV (SOL chain)"
-                )
+            return Decimal(str(float(x)))
+        except Exception:
+            return Decimal(default)
+
+def _q2(x: Decimal) -> Decimal:
+    return x.quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
+
+# ---- Zeitzone / UTC-Offset aus ENV (kompatibel zu Auto-Watch)
+def _parse_offset_hhmm(val: str) -> float:
+    v = val.strip()
+    sign = 1
+    if v[0] in "+-":
+        sign = 1 if v[0] == "+" else -1
+        v = v[1:]
+    if ":" in v:
+        hh, mm = v.split(":", 1)
+        return sign * (float(hh) + float(mm) / 60.0)
+    return sign * float(v)
+
+def _env_utc_offset_hours() -> float:
+    # 0) Explizit: ALLOWED_HOURS_TZ_OFFSET_MIN (Offset in Minuten, kann negativ sein)
+    off_min = os.environ.get("ALLOWED_HOURS_TZ_OFFSET_MIN")
+    if off_min not in (None, ""):
+        try:
+            return float(int(off_min) / 60.0)
         except Exception:
             pass
 
+    # 1) TZ-Name (Europe/Berlin, UTC, Asia/Dubai, ...)
+    tz_env = os.environ.get("AUTO_WATCH_TZ") or os.environ.get("BOT_TZ") or os.environ.get("TZ")
+    if tz_env and any(c.isalpha() for c in tz_env):
+        try:
+            from zoneinfo import ZoneInfo
+            tz = ZoneInfo(tz_env)
+            off = (dt.datetime.now(tz).utcoffset() or dt.timedelta(0)).total_seconds() / 3600.0
+            return float(off)
+        except Exception:
+            pass
 
-#=================================================================================================
+    # 2) Direkter Offset (+02:00, -5, +5.5, ...)
+    off_env = (
+        os.environ.get("AUTO_WATCH_UTC_OFFSET")
+        or os.environ.get("BOT_UTC_OFFSET")
+        or os.environ.get("UTC_OFFSET")
+        or os.environ.get("TZ_OFFSET")
+    )
+    if off_env:
+        try:
+            return _parse_offset_hhmm(off_env)
+        except Exception:
+            pass
+
+    return 0.0  # Default: UTC
+
+
+def _utc_boundaries_for_day_and_week() -> tuple[int, int]:
+    """
+    Liefert (ts_day0_utc, ts_week_ago_utc)
+    - Day: lokale Mitternacht (gem. ENV) in UTC
+    - Week: rollierende 7 Tage
+    """
+    off = _env_utc_offset_hours()
+    now_utc = dt.datetime.now(dt.timezone.utc)
+    local_now = now_utc + dt.timedelta(hours=off)
+    local_midnight = dt.datetime(local_now.year, local_now.month, local_now.day)
+    day0_utc = (local_midnight - dt.timedelta(hours=off)).replace(tzinfo=dt.timezone.utc)
+    ts_day0 = int(day0_utc.timestamp())
+    ts_week = int((now_utc - dt.timedelta(days=7)).timestamp())
+    return ts_day0, ts_week
+
+# ---- CSV laden
+def _load_trades_csv() -> list[dict]:
+    if not os.path.exists(PNL_CSV):
+        return []
+    rows = []
+    with open(PNL_CSV, "r", encoding="utf-8", newline="") as f:
+        rdr = csv.DictReader(f)
+        for r in rdr:
+            rows.append(r)
+    return rows
+
+# ---- Realized aus Zeile: 'realized_usd' bevorzugt, sonst qty*(exit-entry)
+def _realized_from_row(row: dict) -> Decimal:
+    ru = _d(row.get("realized_usd"))
+    if ru != 0:
+        return ru
+    # Rückwärtskomp: altern. Felder/Notes
+    ru = _d(row.get("realized")) or _d(row.get("pnl")) or _d(row.get("profit"))
+    if ru != 0:
+        return ru
+    qty = _d(row.get("qty"))
+    entry_px = _d(row.get("entry_px"))
+    exit_px = _d(row.get("exit_px"))
+    if qty != 0 and (entry_px != 0 or exit_px != 0):
+        return (exit_px - entry_px) * qty
+    return Decimal("0")
+
+# ---- Event-Erkennung: TP1/TP2/SL/TSL/SELL/BUY (Selektion aus side/status/note)
+def _extract_event(row: dict) -> str:
+    text = " ".join([(row.get("side") or ""), (row.get("status") or ""), (row.get("note") or "")]).upper()
+    # Reihenfolge beachten (TSL enthält "SL")
+    if "TP2" in text or "TP 2" in text:
+        return "TP2"
+    if "TP1" in text or "TP 1" in text:
+        return "TP1"
+    if "TRAIL" in text or "TSL" in text or "TRAILING SL" in text:
+        return "TSL"
+    if " SL" in f" {text} " or text.strip() == "SL":
+        return "SL"
+    if "SELL" in text:
+        return "SELL"
+    if "BUY" in text:
+        return "BUY"
+    return ""
+
+# ---- Max-Drawdown auf kumulierter Realized-Kurve
+def _max_drawdown(curve: list[Decimal]) -> Decimal:
+    if not curve:
+        return Decimal("0")
+    peak = curve[0]
+    mdd = Decimal("0")
+    for v in curve:
+        if v > peak:
+            peak = v
+        dd = peak - v
+        if dd > mdd:
+            mdd = dd
+    return _q2(mdd)
+
+# ---- Aggregation über Zeitraum
+def _aggregate_for_range(rows: list[dict], ts_from: int | None) -> tuple[Decimal, dict, dict, int]:
+    """
+    Returns:
+      realized_sum (Decimal),
+      event_counts {'TP1':int,'TP2':int,'SL':int,'TSL':int,'SELL':int,'BUY':int},
+      stats {'executions':int,'wins':int,'losses':int,'flat':int,'mdd':Decimal},
+      unique_tokens_count
+    """
+    realized = Decimal("0")
+    counts = {k: 0 for k in ("TP1","TP2","SL","TSL","SELL","BUY")}
+    wins = losses = flat = 0
+    execs = 0
+    tokens = set()
+    curve = []
+    cum = Decimal("0")
+
+    for r in rows:
+        try:
+            ts = int(r.get("ts") or r.get("timestamp") or 0)
+        except Exception:
+            ts = 0
+        if ts_from is not None and ts < ts_from:
+            continue
+
+        side = (r.get("side") or "").strip()
+        if side:
+            execs += 1
+
+        ev = _extract_event(r)
+        if ev:
+            counts[ev] += 1
+
+        # Realized nur auf Close-/Sell-/TP/SL-Events
+        if ev in ("TP1","TP2","SL","TSL","SELL") or "SELL" in (side.upper()):
+            rr = _realized_from_row(r)
+            if rr != 0:
+                realized += rr
+                cum += rr
+                curve.append(cum)
+                if rr > 0:
+                    wins += 1
+                elif rr < 0:
+                    losses += 1
+                else:
+                    flat += 1
+            tok = (r.get("token") or r.get("mint") or "").strip()
+            if tok:
+                tokens.add(tok)
+
+    mdd = _max_drawdown(curve)
+    stats = {"executions": execs, "wins": wins, "losses": losses, "flat": flat, "mdd": mdd}
+    return _q2(realized), counts, stats, len(tokens)
+
+# ---- Snapshot-Text (wird von /pnl und Auto-Push genutzt)
+async def _pnl_snapshot_text() -> str:
+    rows = _load_trades_csv()
+    ts_day0, ts_week = _utc_boundaries_for_day_and_week()
+
+    d_sum, d_cnt, d_stats, d_tokens = _aggregate_for_range(rows, ts_day0)
+    w_sum, w_cnt, w_stats, w_tokens = _aggregate_for_range(rows, ts_week)
+    t_sum, t_cnt, t_stats, t_tokens = _aggregate_for_range(rows, None)
+
+    # Unrealized (offene Positionen) – bestehende Funktion nutzen, wenn verfügbar
+    unreal_total = Decimal("0")
+    try:
+        ut, _ = total_unreal_pnl()  # ← deine vorhandene Funktion
+        unreal_total = _q2(Decimal(str(ut)))
+    except Exception:
+        pass
+
+    def _fmt_stats(label, s, tok_count):
+        hr = (s["wins"] / max(1, (s["wins"] + s["losses"])) * 100.0)
+        return (
+            f"• {label}:  {s['wins']} | {s['losses']} | {s['flat']}  | "
+            f"Hit-Rate: {hr:.1f}%  | Tokens: {tok_count}"
+        )
+
+    lines = [
+        "📊 P&L – Übersicht",
+        "💰 Realized",
+        f"• Day:   {d_sum:+,.2f} USD",
+        f"• Week:  {w_sum:+,.2f} USD",
+        f"• Total: {t_sum:+,.2f} USD",
+        f"• Unrealized (Open): {unreal_total:+,.2f} USD",
+        "",
+        "🎯 Trigger-Zähler (TP/SL/TSL)",
+        f"• Day:   TP1 {d_cnt['TP1']} | TP2 {d_cnt['TP2']} | SL {d_cnt['SL']} | TSL {d_cnt['TSL']}",
+        f"• Week:  TP1 {w_cnt['TP1']} | TP2 {w_cnt['TP2']} | SL {w_cnt['SL']} | TSL {w_cnt['TSL']}",
+        f"• Total: TP1 {t_cnt['TP1']} | TP2 {t_cnt['TP2']} | SL {t_cnt['SL']} | TSL {t_cnt['TSL']}",
+        "",
+        "📉 Max Drawdown",
+        f"• Day:   {-d_stats['mdd']:+,.2f} USD",
+        f"• Week:  {-w_stats['mdd']:+,.2f} USD",
+        f"• Total: {-t_stats['mdd']:+,.2f} USD",
+        "",
+        "📋 Trade-Stats",
+        _fmt_stats("Day  (W|L|F)", d_stats, d_tokens),
+        _fmt_stats("Week (W|L|F)", w_stats, w_tokens),
+        _fmt_stats("Total(W|L|F)", t_stats, t_tokens),
+    ]
+    return "\n".join(lines)
+
+# ---- Auto-Push nach SELL/TP/SL (aktiv: PNL_AUTO_PUSH=1)
+async def _pnl_auto_push():
+    if os.environ.get("PNL_AUTO_PUSH", "0").strip().lower() in ("1","true","yes","on"):
+        try:
+            await tg_post(await _pnl_snapshot_text())
+        except Exception:
+            pass
+
+async def cmd_pnl_tail(update, context):
+    if not guard(update):
+        return
+    rows = _load_trades_csv()
+    if not rows:
+        return await send(update, "Keine Einträge in trades_log.csv.")
+    last = rows[-10:]
+    out = ["📄 Letzte Trades (CSV):"]
+    for r in last:
+        out.append(
+            f"{r.get('ts_iso','?')}  {(r.get('side') or '?'):>10}  "
+            f"{(r.get('token') or r.get('mint') or '?'):<12}  "
+            f"realized={r.get('realized_usd','') or '-'}  sig={r.get('sig','')}"
+        )
+    await send(update, "\n".join(out))
+
+
+# ----------------------
+# Telegram Commands
+# ----------------------
+
+# /pnl  -> Textübersicht
+# /pnl  -> Textübersicht (mit Buttons)
+async def cmd_pnl(update, context):
+    if not guard(update):
+        return
+    try:
+        text = await _pnl_snapshot_text()
+
+        keyboard = InlineKeyboardMarkup([
+            [
+                InlineKeyboardButton("📈 Chart zeigen", callback_data="PNL:CHART"),
+                InlineKeyboardButton("📥 CSV laden",   callback_data="PNL:CSV"),
+            ],
+            [
+                InlineKeyboardButton("📦 CSV (ZIP)",   callback_data="PNL:CSVALL"),
+            ],
+        ])
+
+        await context.bot.send_message(
+            chat_id=update.effective_chat.id,
+            text=text,
+            reply_markup=keyboard
+        )
+    except Exception as e:
+        await send(update, f"PNL-Fehler: {e}")
+
+# Inline-Button Callback: Chart / CSV / ZIP
+async def cb_pnl_buttons(update, context):
+    q = update.callback_query
+    data = (q.data or "")
+    try:
+        await q.answer()
+    except Exception:
+        pass
+
+    # Damit guard(update) in den Commands funktioniert, den gleichen update weiterreichen
+    if data == "PNL:CHART":
+        return await cmd_pnl_chart(update, context)
+    elif data == "PNL:CSV":
+        return await cmd_pnl_csv(update, context)
+    elif data == "PNL:CSVALL":
+        return await cmd_pnl_csv_all(update, context)
+
+# /pnl_csv -> aktuelle CSV als Download
+async def cmd_pnl_csv(update, context):
+    if not guard(update):
+        return
+    if not os.path.exists(PNL_CSV):
+        return await send(update, "Keine trades_log.csv gefunden.")
+    try:
+        caption = "📥 trades_log.csv"
+        with open(PNL_CSV, "rb") as f:
+            await context.bot.send_document(
+                chat_id=update.effective_chat.id,
+                document=f,
+                filename=os.path.basename(PNL_CSV),
+                caption=caption
+            )
+    except Exception as e:
+        await send(update, f"CSV-Download fehlgeschlagen: {e}")
+
+# /pnl_csv_all -> alle CSV-Varianten (inkl. .bak) als ZIP
+async def cmd_pnl_csv_all(update, context):
+    if not guard(update):
+        return
+    candidates = glob.glob(os.path.join(BASE_DIR, "trades_log.csv*"))
+    if not candidates:
+        return await send(update, "Keine CSV-Dateien gefunden.")
+    zip_path = os.path.join(BASE_DIR, f"trades_logs_{int(time.time())}.zip")
+    try:
+        with zipfile.ZipFile(zip_path, "w", zipfile.ZIP_DEFLATED) as zf:
+            for p in candidates:
+                if os.path.isfile(p):
+                    zf.write(p, arcname=os.path.basename(p))
+        with open(zip_path, "rb") as f:
+            await context.bot.send_document(
+                chat_id=update.effective_chat.id,
+                document=f,
+                filename=os.path.basename(zip_path),
+                caption="📥 Alle PNL-CSV-Dateien (ZIP)"
+            )
+    except Exception as e:
+        await send(update, f"ZIP-Export fehlgeschlagen: {e}")
+    finally:
+        try:
+            if os.path.exists(zip_path):
+                os.remove(zip_path)
+        except Exception:
+            pass
+
+# /pnl_chart -> Bar-Chart Day/Week/Total (Realized)
+async def cmd_pnl_chart(update, context):
+    if not guard(update):
+        return
+    try:
+        rows = _load_trades_csv()
+        ts_day0, ts_week = _utc_boundaries_for_day_and_week()
+        d_sum, _, _, _ = _aggregate_for_range(rows, ts_day0)
+        w_sum, _, _, _ = _aggregate_for_range(rows, ts_week)
+        t_sum, _, _, _ = _aggregate_for_range(rows, None)
+
+        # Matplotlib (Headless)
+        import matplotlib
+        matplotlib.use("Agg")
+        import matplotlib.pyplot as plt
+
+        labels = ["Day", "Week", "Total"]
+        vals = [float(d_sum), float(w_sum), float(t_sum)]
+
+        fig, ax = plt.subplots(figsize=(6, 4), dpi=150)
+        bars = ax.bar(labels, vals)
+        for bar, val in zip(bars, vals):
+            ax.text(
+                bar.get_x() + bar.get_width() / 2.0,
+                bar.get_height(),
+                f"{val:+.2f}",
+                ha="center", va="bottom", fontsize=9
+            )
+        ax.set_title("Realized PnL")
+        ax.set_ylabel("USD")
+        ax.axhline(0, linewidth=1)
+        fig.tight_layout()
+
+        tmp = tempfile.NamedTemporaryFile(delete=False, suffix=".png")
+        fig.savefig(tmp.name)
+        import pathlib
+        try:
+            plt.close(fig)
+        except Exception:
+            pass
+
+        with open(tmp.name, "rb") as f:
+            await context.bot.send_photo(
+                chat_id=update.effective_chat.id,
+                photo=f,
+                caption="📈 PnL – Day/Week/Total"
+            )
+        try:
+            os.remove(tmp.name)
+        except Exception:
+            pass
+
+    except Exception as e:
+        await send(update, f"Chart-Fehler: {e}")
+
+# ----------------------
+# Hinweise zur Einbindung
+# ----------------------
+# 1) Commands registrieren:
+#    app.add_handler(CommandHandler("pnl",         cmd_pnl))
+#    app.add_handler(CommandHandler("pnl_tail",    cmd_pnl_tail))
+#    app.add_handler(CommandHandler("pnl_csv",     cmd_pnl_csv))
+#    app.add_handler(CommandHandler("pnl_csv_all", cmd_pnl_csv_all))
+#    app.add_handler(CommandHandler("pnl_chart",   cmd_pnl_chart))
+#
+# 2) Auto-Push aktivieren (optional):
+#    ENV setzen: PNL_AUTO_PUSH=1
+#    und nach JEDEM SELL/TP/SL-Logeintrag in deinen Order-Handlern:
+#       await _pnl_auto_push()
+#
+
+#====================================== END PNL ===========================================================
 # Strategy v1.6.3 (leicht erweitert mit Diag)
 # =========================
 def sma(series: deque, length: int) -> Optional[float]:
@@ -2852,7 +3133,7 @@ class Config:
     pause_minutes: int = 10 # 15
     max_trades_per_hour: int = 30 # 24
     time_exit_bars: int = 60 # 900
-    allowed_hours_csv: str  = "2,3,4,5,10,11,12,13,14,15,16,23"
+    allowed_hours_csv="6,7,8,9,10,11,12,13,14,15,16,17,18,19,20"
 
 
 
@@ -3081,8 +3362,8 @@ CONFIG_1M = Config(
     pause_after_losses=3,
     pause_minutes=12,
     max_trades_per_hour=8,
-    #allowed_hours_csv="2,3,4,5,10,11,12,13,14,15,16,23",
-    allowed_hours_csv="",
+    allowed_hours_csv="6,7,8,9,10,11,12,13,14,15,16,17,18,19,20"
+   # allowed_hours_csv="",
 )
 
 # =========================
@@ -3186,19 +3467,42 @@ async def _measure_liquidity(mint: str) -> dict:
     Liefert:
       {
         'raydium_refs': int, 'orca_refs': int, 'meteora_refs': int,
-        'total_refs': int, 'lp_sol': float
+        'total_refs': int, 'lp_sol': float,
+        'name': str, 'ds_url': str
       }
     """
     refs = await _count_liquidity_refs_async(mint)
     best = _aw_extract_best_pair(mint)
     lp_sol = _lp_sol_of_pair(best) if best else 0.0
+
+    # Token-Name + Dexscreener-URL (robust, mit Fallback)
+    name = (mint[:6] + "…")
+    url  = f"https://dexscreener.com/solana/{mint}"
+    try:
+        if best:
+            base = (best.get("baseToken") or {})
+            sym  = (base.get("symbol") or "").strip()
+            nm   = (base.get("name") or "").strip()
+            name = sym or nm or name
+            url  = (best.get("url") or url)
+        else:
+            nm, _ag = dexscreener_token_meta(mint)
+            if nm:
+                name = nm
+    except Exception:
+        # keep fallbacks
+        pass
+
     return {
         "raydium_refs": int(refs.get("raydium_refs",0)),
         "orca_refs":    int(refs.get("orca_refs",0)),
         "meteora_refs": int(refs.get("meteora_refs",0)),
         "total_refs":   int(refs.get("total_liq_refs",0)),
         "lp_sol":       float(lp_sol or 0.0),
+        "name":         name,
+        "ds_url":       url,
     }
+
 
 def _liq_snapshot_text() -> list[str]:
     return [
@@ -3232,20 +3536,22 @@ async def _liq_check_one_and_report(mint: str) -> tuple[str, dict, dict]:
 
 def _liq_format_line(mint: str, cur: dict, prev: dict) -> str:
     refs = cur["total_refs"]; lp = cur["lp_sol"]
-    # Delta berechnen
     prev_refs = int(prev.get("last_total_refs") or 0)
     prev_lp   = float(prev.get("last_lp_sol") or 0.0)
     d_refs = refs - prev_refs
-    d_lp_pct = _calc_delta_pct(prev_lp, lp)
-    # Icons
+    d_lp_pct_raw = _calc_delta_pct(prev_lp, lp)
+    arrow, _ = _lp_dir_arrow(prev_lp, lp)
+
     ico_r = "✅" if cur["raydium_refs"]>0 else "❌"
     ico_o = "✅" if cur["orca_refs"]>0    else "❌"
     ico_m = "✅" if cur["meteora_refs"]>0 else "❌"
-    # Delta-Text
+
+    name = (cur.get("name") or "").strip() or (mint[:6] + "…")
+    url  = (cur.get("ds_url") or f"https://dexscreener.com/solana/{mint}")
     d_refs_txt = f"{'+' if d_refs>=0 else ''}{d_refs}"
-    d_lp_txt   = f"{'+' if d_lp_pct>=0 else ''}{int(d_lp_pct)}%"
-    return (f"{mint[:6]}…  Refs={refs} ({ico_r}R {ico_o}O {ico_m}M, Δ={d_refs_txt})  "
-            f"LP≈{_fmt_lp(lp)} SOL (Δ={d_lp_txt})")
+    # LP-Teil inkl. Richtungspfeil
+    return (f"{name} ({mint[:6]}…)  Refs={refs} ({ico_r}R {ico_o}O {ico_m}M, Δ={d_refs_txt})  "
+            f"LP≈{_fmt_lp(lp)} SOL ({arrow} {_fmt_pct(d_lp_pct_raw)})  {url}")
 
 async def _liq_maybe_prune(mint: str, cur: dict) -> Optional[str]:
     if not LIQ_CFG["prune_empty"]:
@@ -3260,24 +3566,60 @@ async def _liq_maybe_prune(mint: str, cur: dict) -> Optional[str]:
         return "pruned: no pools"
     return None
 
+def _lp_dir_arrow(prev_lp: float, cur_lp: float) -> tuple[str, str]:
+    """
+    Gibt (arrow, word) zurück:
+      "↑" / "↓" (bzw. "→" wenn unverändert) und "up"/"down"/"flat".
+    """
+    try:
+        p = float(prev_lp or 0.0)
+        c = float(cur_lp or 0.0)
+    except Exception:
+        p, c = 0.0, 0.0
+    if c > p:
+        return "↑", "up"
+    if c < p:
+        return "↓", "down"
+    return "→", "flat"
+
+def _fmt_pct(x: float) -> str:
+    try:
+        return f"{abs(x):.0f}%"
+    except Exception:
+        return "0%"
+
+
 def _liq_should_alert(cur: dict, prev: dict) -> tuple[bool, list[str]]:
+    """
+    Liefert (should_alert, messages[]).
+    LP-Text enthält jetzt klare Richtungspfeile und absolute/relative Änderung.
+    """
     msgs = []
-    # Refs-Alert
+
+    # Refs-Delta
     prev_refs = int(prev.get("last_total_refs") or 0)
     cur_refs  = int(cur.get("total_refs") or 0)
     if abs(cur_refs - prev_refs) >= LIQ_CFG["delta_refs"]:
-        if cur_refs > prev_refs:
-            msgs.append(f"Refs +{cur_refs - prev_refs}")
-        else:
-            msgs.append(f"Refs {cur_refs - prev_refs}")
-    # LP-Alert
+        sign = "+" if (cur_refs - prev_refs) >= 0 else ""
+        msgs.append(f"Refs {sign}{cur_refs - prev_refs}")
+
+    # LP-Delta (in %)
     prev_lp = float(prev.get("last_lp_sol") or 0.0)
     cur_lp  = float(cur.get("lp_sol") or 0.0)
-    delta_lp_pct = abs(_calc_delta_pct(prev_lp, cur_lp))
-    if delta_lp_pct >= LIQ_CFG["delta_lp_pct"]:
-        sign = "+" if cur_lp >= prev_lp else "−"
-        msgs.append(f"LP {sign}{int(delta_lp_pct)}%")
-    return (len(msgs)>0, msgs)
+    delta_pct_raw = _calc_delta_pct(prev_lp, cur_lp)  # dein vorhandener %-Helper
+    delta_pct = abs(delta_pct_raw)
+
+    if delta_pct >= LIQ_CFG["delta_lp_pct"]:
+        arrow, word = _lp_dir_arrow(prev_lp, cur_lp)
+        # absolute Änderung in SOL
+        delta_abs = cur_lp - prev_lp
+        sign = "+" if delta_abs >= 0 else ""
+        # Beispiel:  LP ↑ +12% (+345.7 SOL)
+        msgs.append(f"LP {arrow} {_fmt_pct(delta_pct)} ({sign}{delta_abs:.1f} SOL)")
+
+    return (len(msgs) > 0, msgs)
+
+
 
 async def liq_check_watchlist_once() -> dict:
     """
@@ -3301,6 +3643,7 @@ async def liq_check_watchlist_once() -> dict:
         added = []
         pruned = []
         alerted = []
+        alert_lines = []  # für die Telegram-Alert-Zusammenfassung (mit Name + Link)
 
         for mint in tokens:
             try:
@@ -3318,7 +3661,11 @@ async def liq_check_watchlist_once() -> dict:
                 # Alerts (Δrefs / ΔLP%)
                 do_alert, msg = _liq_should_alert(cur, prev)
                 if do_alert:
-                    alerted.append((m, "; ".join(msg)))
+                    nm  = (cur.get("name") or (m[:6] + "…"))
+                    url = (cur.get("ds_url") or f"https://dexscreener.com/solana/{m}")
+                    # "msg" kommt schon mit Richtungs-Pfeil aus _liq_should_alert()
+                    alert_lines.append(f"- {nm} ({m[:6]}…) " + "; ".join(msg) + f"\n{url}")
+                    alerted.append((m, "; ".join(msg)))     
             except Exception as e:
                 lines.append(f"• {mint[:6]}… error: {e}")
 
@@ -3328,8 +3675,8 @@ async def liq_check_watchlist_once() -> dict:
 
         # Summary posten
         await tg_post("\n".join(lines))
-        if alerted:
-            txt = "⚠️ Liquidity Alerts:\n" + "\n".join([f"- {m[:6]}… {t}" for m, t in alerted])
+        if alert_lines:
+            txt = "⚠️ Liquidity Alerts:\n" + "\n".join(alert_lines)
             await tg_post(txt)
 
         return {"n": len(tokens), "added": added, "pruned": pruned, "alerted": alerted}
@@ -3592,55 +3939,121 @@ def update_indicators_and_debug(st: IndiState, candle: Dict[str, float], *, atr_
 
 def format_debug_line(mint: str, dbg: Dict[str, float], lookback_secs: int) -> str:
     return (f"🔎 {mint[:6]} px={dbg['px']:.6f} v5s≈{lookback_secs} | ATR={dbg['ATR']:.6f} ADX={dbg['ADX']:.1f} | vol_ok={'True' if dbg['vol_ok'] else 'False'}")
-#===============================================================================
-    
-async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+#============================START ===================================================
+def _collect_all_commands(app) -> list[str]:
     """
-    Start/Help: zeigt Schnellbefehle + vollständige Befehlsübersicht,
-    passend zu den in build_app() registrierten Commands.
+    Liest alle in der Application registrierten CommandHandler ein (Gruppe 0..n)
+    und liefert eine sortierte Liste der Befehlsnamen (ohne '/').
     """
+    cmds = set()
+    try:
+        for _, handlers in (app.handlers or {}).items():
+            for h in handlers:
+                # PTB v20+: CommandHandler hat 'commands' (set[str])
+                if hasattr(h, "commands") and h.commands:
+                    for c in h.commands:
+                        # .commands kann strings oder Objects enthalten; wir normalisieren
+                        cmds.add(str(c).lstrip("/"))
+    except Exception:
+        pass
+    return sorted(cmds)
+
+def _categorize_commands(cmds: list[str]) -> dict:
+    cats = {
+        "📊 PnL & Reporting": [],
+        "💧 Liquidity": [],
+        "🪙 Trading": [],
+        "🧰 System/Tools": [],
+        "🗂️ Sonstiges": [],
+    }
+    for c in cmds:
+        lc = c.lower()
+        if "pnl" in lc or "stats" in lc or "chart" in lc:
+            cats["📊 PnL & Reporting"].append(c)
+        elif "liq" in lc or "watch" in lc or "auto" in lc:
+            cats["💧 Liquidity"].append(c)
+        elif lc in {"buy","sell","close","open","tp","sl","cancel"} or any(k in lc for k in ["trade","order"]):
+            cats["🪙 Trading"].append(c)
+        elif lc in {"start","help","ping","status","version","info","config","settings"}:
+            cats["🧰 System/Tools"].append(c)
+        else:
+            cats["🗂️ Sonstiges"].append(c)
+    # Leere Kategorien entfernen
+    return {k:v for k,v in cats.items() if v}
+
+def _mini_pnl_line() -> str:
+    """
+    Kleine 'Grafik' direkt im Text: Day | Week | Total (Realized).
+    Nutzt die bereits vorhandenen PnL-Helfer.
+    """
+    try:
+        rows = _load_trades_csv()
+        ts_day0, ts_week = _utc_boundaries_for_day_and_week()
+        d_sum, _, _, _ = _aggregate_for_range(rows, ts_day0)
+        w_sum, _, _, _ = _aggregate_for_range(rows, ts_week)
+        t_sum, _, _, _ = _aggregate_for_range(rows, None)
+
+        def f(x):  # Pfeil + Wert
+            x = float(x)
+            arrow = "📈" if x >= 0 else "📉"
+            return f"{arrow}{x:+.2f}"
+
+        return f"Mini-PnL  Day {f(d_sum)} | Week {f(w_sum)} | Total {f(t_sum)}"
+    except Exception:
+        return "Mini-PnL  (noch keine Daten)"
+
+
+# /start – Übersicht mit Buttons und Mini-Grafik
+async def cmd_start(update, context):
     if not guard(update):
         return
 
-    helius_txt = "Helius" if is_helius_url(RPC_URL) else "Custom RPC"
+    # 1) Dynamisch alle Commands einsammeln & gruppieren
+    cmds = _collect_all_commands(context.application)
+    cats = _categorize_commands(cmds)
 
-    quick = " /dashboard  •  /pnl  •  /open_trades  •  /list_watch  •  /aw_status  •  /check_liq USDC "
-    wl = ", ".join(WATCHLIST) or "-"
-
+    # 2) Headline + Mini-PnL
     lines = [
-        f"🤖 <b>Auto-Trade-BOT with Autowach for SOL chain</b>",
-        f"Wallet: <code>{WALLET_PUBKEY}</code>",
-        f"RPC: <code>{RPC_URL}</code> ({helius_txt})",
-        f"Watchlist: {wl}",
+        "👋 Willkommen! Hier ist deine Übersicht.",
+        _mini_pnl_line(),
         "",
-        f"⚡ <b>Schnellbefehle</b>:<code>{quick}</code>",
-        "",
-        "— <b>Core</b>",
-        "<code>/boot</code> / <code>/shutdown</code> – Bot an/aus, <code>/diag_webhook</code>",
-        "<code>/status</code>, <code>/health</code>, <code>/diag</code>, <code>/dashboard</code>",
-        "<code>/debug on|off</code>, <code>/set_proxy &lt;url|off&gt;</code>",
-        "",
-        "— <b>Trading</b>",
-        "<code>/buy &lt;MINT&gt; [sol]</code>, <code>/sell_all &lt;MINT&gt;</code>",
-        "<code>/set_notional &lt;sol&gt;</code>, <code>/set_slippage &lt;pct&gt;</code>, <code>/set_fee &lt;SOL&gt;</code>",
-        "<code>/positions</code>, <code>/open_trades</code>, <code>/pnl</code>",
-        "<code>/chart &lt;MINT&gt; [bars]</code>",
-        "",
-        "— <b>Discovery &amp; Sanity</b>",
-        "<code>/scan_ds</code> [Flags], <code>/sanity &lt;MINT&gt;</code>",
-        "<code>/dsdiag</code>, <code>/dsraw</code>, <code>/ds_trending</code>, <code>/trending</code> [n [focus] [quote]]",
-        "",
-        "— <b>Auto-Watchlist</b>",
-        "<code>/autowatch on|off</code>, <code>/aw_status</code>, <code>/aw_config</code> [Flags], <code>/aw_now</code>, <code>/aw_observe</code>",
-        "",
-        "— <b>Watchlist</b>",
-        "<code>/list_watch</code>, <code>/add_watch &lt;MINT&gt;</code>, <code>/remove_watch &lt;MINT&gt;</code>",
-        "",
-        "— <b>Liquidity</b>",
-        "<code>/check_liq &lt;MINT&gt;</code>, <code>/auto_liq on|off</code>, <code>/liq_config</code> [Flags], <code>/check_liq_onchain &lt;MINT&gt;</code>",
+        "Verfügbare Befehle:",
     ]
 
-    await update.message.reply_text("\n".join(lines), parse_mode=ParseMode.HTML)
+    # 3) Kategorien rendern
+    for title, items in cats.items():
+        pretty = " /".join(sorted(set(items)))
+        # kurze, „grafische“ Bulletpoints
+        lines.append(f"\n{title}\n• /" + pretty)
+
+    text = "\n".join(lines)
+
+    # 4) Buttons (häufig genutzte Actions)
+    keyboard_rows = []
+    keyboard_rows.append([
+        InlineKeyboardButton("📊 PnL",        callback_data="GO:/pnl"),
+        InlineKeyboardButton("📈 Chart",      callback_data="GO:/pnl_chart"),
+    ])
+    keyboard_rows.append([
+        InlineKeyboardButton("📥 CSV",        callback_data="GO:/pnl_csv"),
+        InlineKeyboardButton("📦 CSV (ZIP)",  callback_data="GO:/pnl_csv_all"),
+    ])
+    # Liquidity-Buttons nur anzeigen, wenn es passende Commands gibt
+    liq_cmds = ["/check_liq", "/liq_config", "/auto_liq", "/auto_liq_on", "/auto_liq_off"]
+    if any(c.strip("/") in cmds for c in [c.strip("/") for c in liq_cmds]):
+        keyboard_rows.append([
+            InlineKeyboardButton("💧 Liquidity", callback_data="GO:/check_liq"),
+            InlineKeyboardButton("⚙️ Liq Config", callback_data="GO:/liq_config"),
+        ])
+
+    keyboard = InlineKeyboardMarkup(keyboard_rows)
+
+    await context.bot.send_message(
+        chat_id=update.effective_chat.id,
+        text=text,
+        reply_markup=keyboard
+    )
+
 
 #===============================================================================
     
@@ -4063,15 +4476,23 @@ async def cmd_dsraw(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # 1) Query aus Args, sonst eine kleine Default-Kaskade (ohne 'chain:solana')
     user_q = " ".join(context.args).strip() if context.args else None
     queries = [user_q] if user_q else ["quoteToken:SOL", "raydium", "sol usdc", "pumpfun"]
-
-    def _fmt_usd(x: float) -> str:
+    
+    def _fmt_usd(x) -> str:
+        """Komakter USD-Formatter: 1.23k / 4.56M / 7.89B."""
         try:
-            return f"${int(float(x)):,}"
+            v = float(x or 0)
         except Exception:
-            try:
-                return f"${float(x):,.2f}"
-            except Exception:
-                return "$0"
+            v = 0.0
+        sgn = "-" if v < 0 else ""
+        v = abs(v)
+        if v >= 1_000_000_000:
+            return f"{sgn}${v/1_000_000_000:.2f}B"
+        if v >= 1_000_000:
+            return f"{sgn}${v/1_000_000:.2f}M"
+        if v >= 1_000:
+            return f"{sgn}${v/1_000:.2f}k"
+        return f"{sgn}${v:.2f}"
+
 
     async def _search(q: str) -> list[dict]:
         js = await _get_json(_wrap(f"{DS_BASE}/search?q={quote_plus(q)}"))
@@ -4760,212 +5181,241 @@ def _pnl_by_mint_from_csv() -> Dict[str, float]:
     # sauber auf 2 NK runden
     return {k: float(v.quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)) for k, v in agg.items()}
 
-#===============================================================================
-# Watchlist (nach Volumen sortiert + DexScreener-Link)
-#===============================================================================
-async def on_cb_remove_watch(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Callback für '🗑 Remove' in /list_watch."""
+#===========================WATCHLIST====================================================
+# =========================
+# WATCHLIST: Add / Remove (Drop-in)
+# =========================
+from telegram import InlineKeyboardMarkup, InlineKeyboardButton
+from telegram.ext import CommandHandler, CallbackQueryHandler
+import re
+
+# --- Helpers: Persistenz an LIQ_STATE koppeln (fallback: nur in WATCHLIST)
+def _watchlist_current_set() -> set:
+    try:
+        if isinstance(LIQ_STATE.get("watchlist"), list):
+            return set(LIQ_STATE["watchlist"])
+    except Exception:
+        pass
+    try:
+        return set(WATCHLIST)
+    except Exception:
+        return set()
+
+def _watchlist_set_persist(newset: set):
+    # Globales WATCHLIST-Array aktualisieren (in-place)
+    try:
+        WATCHLIST[:] = list(sorted(newset))
+    except Exception:
+        pass
+    # In LIQ_STATE speichern, wenn vorhanden
+    try:
+        if isinstance(LIQ_STATE, dict):
+            LIQ_STATE["watchlist"] = list(sorted(newset))
+            try:
+                _liq_save_state(LIQ_STATE)  # falls vorhanden
+            except Exception:
+                pass
+    except Exception:
+        pass
+
+def _mint_from_text(s: str) -> str | None:
+    """Extrahiert SOL-Mint aus plain Mint, Dexscreener-URL oder freiem Text."""
+    if not s:
+        return None
+    s = s.strip()
+    # dexscreener.com/solana/<mint>
+    m = re.search(r"dexscreener\.com/solana/([1-9A-HJ-NP-Za-km-z]{32,44})", s)
+    if m:
+        return m.group(1)
+    # blank mint (Base58)
+    if re.fullmatch(r"[1-9A-HJ-NP-Za-km-z]{32,44}", s):
+        return s
+    return None
+
+def _ds_url(mint: str) -> str:
+    return f"https://dexscreener.com/solana/{mint}"
+
+def _short_mint(m: str) -> str:
+    return (m[:6] + "…") if m else "n/a"
+
+# --- /add_watch <mint|dexscreener-url>
+async def cmd_add_watch(update, context):
+    if not guard(update):
+        return
+    args = context.args or []
+    if not args:
+        return await send(update, "Nutzung: /add_watch <mint|dexscreener-url>")
+    mint = _mint_from_text(" ".join(args))
+    if not mint:
+        return await send(update, "Konnte keine gültige SOL-Mint erkennen.")
+    s = _watchlist_current_set()
+    if mint in s:
+        return await send(update, f"Schon auf der Watchlist: {_short_mint(mint)}")
+    s.add(mint)
+    _watchlist_set_persist(s)
+    # optional Name aus Pair holen
+    name = _short_mint(mint)
+    try:
+        p = _aw_extract_best_pair(mint)
+        if p:
+            base = (p.get("baseToken") or {})
+            name = (base.get("symbol") or base.get("name") or name).strip() or name
+    except Exception:
+        pass
+    await send(update, f"➕ Hinzugefügt: {name} ({_short_mint(mint)})\n{_ds_url(mint)}")
+
+# --- /remove_watch <mint|dexscreener-url>
+async def cmd_remove_watch(update, context):
+    if not guard(update):
+        return
+    args = context.args or []
+    if not args:
+        return await send(update, "Nutzung: /remove_watch <mint|dexscreener-url>")
+    mint = _mint_from_text(" ".join(args))
+    if not mint:
+        return await send(update, "Konnte keine gültige SOL-Mint erkennen.")
+    s = _watchlist_current_set()
+    if mint not in s:
+        return await send(update, f"Nicht auf der Watchlist: {_short_mint(mint)}")
+    s.remove(mint)
+    _watchlist_set_persist(s)
+    await send(update, f"🗑 Entfernt: {_short_mint(mint)}")
+
+# --- Inline-Remove aus der kompakten Watchlist
+async def cb_watchlist_buttons(update, context):
     q = update.callback_query
+    data = (q.data or "")
     try:
         await q.answer()
     except Exception:
         pass
 
-    data = (q.data or "")
-    if not data.startswith("rmw|"):
-        return
+    if data == "WL:REFRESH":
+        return await cmd_watchlist_compact(update, context)
 
-    mint = data.split("|", 1)[1].strip()
+    if data.startswith("WL:RM:"):
+        mint = data.split(":", 2)[2]
+        s = _watchlist_current_set()
+        if mint in s:
+            s.remove(mint)
+            _watchlist_set_persist(s)
+            await send(update, f"🗑 Entfernt: {_short_mint(mint)}")
+        return await cmd_watchlist_compact(update, context)
 
-    removed = False
-    if mint in WATCHLIST:
-        WATCHLIST.remove(mint)
-        removed = True
-        # <<< FIX: State freigeben, wenn keine offene Position vorhanden
-        if mint not in OPEN_POS:
-            _drop_mint_state(mint)
+    # Toleranz für alte Buttons (falls noch irgendwo vorhanden)
+    if data.startswith("rmv|"):
+        mint = data.split("|", 1)[1]
+        s = _watchlist_current_set()
+        if mint in s:
+            s.remove(mint)
+            _watchlist_set_persist(s)
+            await send(update, f"🗑 Entfernt: {_short_mint(mint)}")
+        return await cmd_watchlist_compact(update, context)
 
+def _fmt_usd_watch(x) -> str:
+    """Kompakter USD-Formatter: 1.23k / 4.56M / 7.89B, inkl. Vorzeichen."""
     try:
-        await q.edit_message_reply_markup(reply_markup=None)
+        v = float(x or 0)
     except Exception:
-        pass
+        v = 0.0
+    sgn = "-" if v < 0 else ""
+    v = abs(v)
+    if v >= 1_000_000_000:
+        return f"{sgn}${v/1_000_000_000:.2f}B"
+    if v >= 1_000_000:
+        return f"{sgn}${v/1_000_000:.2f}M"
+    if v >= 1_000:
+        return f"{sgn}${v/1_000:.2f}k"
+    return f"{sgn}${v:.2f}"
 
+def _fmt_tx(buys, sells) -> str:
     try:
-        name, _age = dexscreener_token_meta(mint)
+        b = int(buys or 0); s = int(sells or 0)
+        return f"{b+s} (B{b}/S{s})"
     except Exception:
-        name = mint[:6] + "…"
+        return "n/a"
 
-    if removed:
-        await q.message.chat.send_message(f"🗑 Entfernt: {name} ({mint[:6]}…)")
-    else:
-        await q.message.chat.send_message(f"ℹ️ Bereits nicht mehr in Watchlist: {name} ({mint[:6]}…)")
-
-
-
-async def cmd_list_watch(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """
-    Zeigt die Watchlist (nach 24h-Volumen absteigend) mit:
-      - Name als anklickbaren DexScreener-Link
-      - Alter (Pair-Erstellungszeit)
-      - FDV (mcap) und 24h-Volumen
-      - OPEN-Status (qty @ entry) falls Position existiert
-    """
-    if not guard(update):
-        return
-
-    if not WATCHLIST:
-        return await send(update, "👀 Watchlist: -")
-
-    # Formatter
-    def _fmt_usd(x: float) -> str:
-        try:
-            return f"${int(x):,}"
-        except Exception:
-            try:
-                return f"${float(x):,.2f}"
-            except Exception:
-                return "$0"
-
-    def _age_from_pair(p: dict) -> str:
-        try:
-            ms = (p.get("pairCreatedAt") or p.get("createdAt") or p.get("poolCreatedAt") or 0)
-            return _fmt_age_from_ms(int(ms) if ms else 0)
-        except Exception:
+def _fmt_age_from_ms(created_ms) -> str:
+    try:
+        ms = int(created_ms or 0)
+        if ms <= 0:
             return "n/a"
+        now_ms = int(time.time() * 1000)
+        delta = max(0, now_ms - ms) / 1000.0
+        d = int(delta // 86400)
+        h = int((delta % 86400) // 3600)
+        if d >= 1:  return f"{d}d {h}h"
+        if h >= 1:  return f"{h}h {int((delta % 3600)//60)}m"
+        return f"{int((delta % 3600)//60)}m"
+    except Exception:
+        return "n/a"
 
-    # DS-Daten pro Mint (konkurrenzbegrenzt) holen
-    sem = asyncio.Semaphore(6)
+# --- Kompakte Watchlist AUSGABE (leicht angepasst: pro Zeile ein Remove-Button)
+async def cmd_watchlist_compact(update, context):
+    if not guard(update):
+        return
 
-    async def _fetch_row(mint: str) -> Tuple[str, str, str, float, float]:
-        """
-        Rückgabe: (mint, html_name_link, age_txt, mcap_usd, vol24_usd)
-        """
-        async with sem:
-            # Defaults
-            default_name = mint[:6] + "…"
-            name = default_name
-            url = f"https://dexscreener.com/solana/{mint}"
-            age_txt = "n/a"
-            mcap_usd = 0.0
-            vol24_usd = 0.0
+    tokens = sorted(_watchlist_current_set())
+    if not tokens:
+        return await send(update, "Watchlist ist leer.")
 
-            try:
-                js = _ds_get_json(f"https://api.dexscreener.com/tokens/v1/solana/{mint}", timeout=10)
-                pairs = js.get("pairs") if isinstance(js, dict) else []
-                best = _ds_pick_best_sol_pair(pairs) if pairs else None
-                if best:
-                    base = (best.get("baseToken") or {})
-                    sym  = (base.get("symbol") or "").strip()
-                    nm   = (base.get("name")   or "").strip()
-                    name = sym or nm or name
-                    url  = best.get("url") or url
-                    age_txt = _age_from_pair(best)
-                    try:
-                        vol24_usd = float(((best.get("volume") or {}).get("h24") or 0.0))
-                    except Exception:
-                        vol24_usd = 0.0
-                    try:
-                        mcap_usd = float(best.get("fdv") or 0.0)
-                    except Exception:
-                        mcap_usd = 0.0
-            except Exception:
-                # keine Netzwerkausgabe/Send hier – nur Fallbacks
-                pass
+    # Metriken einsammeln
+    rows = []
+    for mint in tokens:
+        try:
+            meta = _watch_mint_metrics(mint)
+            rows.append((mint, meta))
+        except Exception:
+            rows.append((mint, {
+                "name": _short_mint(mint), "url": f"https://dexscreener.com/solana/{mint}",
+                "age":"n/a", "mcap":0.0, "vol24":0.0, "tx":"n/a", "liq":0.0, "price":0.0
+            }))
 
-            # Zusätzlicher Fallback nur für Name/Alter
-            if name == default_name or age_txt == "n/a":
-                try:
-                    nm2, ag2 = dexscreener_token_meta(mint)
-                    if name == default_name and nm2:
-                        name = nm2
-                    if age_txt == "n/a" and ag2:
-                        age_txt = ag2
-                except Exception:
-                    pass
+    # nach Vol24 absteigend
+    rows.sort(key=lambda x: float((x[1] or {}).get("vol24", 0.0)), reverse=True)
 
-            html_link = f"<a href='{url}'>{name}</a>"
-            return (mint, html_link, age_txt, mcap_usd, vol24_usd)
-
-    # Daten holen
-    tasks = [asyncio.create_task(_fetch_row(m)) for m in WATCHLIST]
-    results = await asyncio.gather(*tasks, return_exceptions=False)
-
-    # Sortierung: Volumen 24h absteigend
-    results.sort(key=lambda r: (r[4] or 0.0), reverse=True)
-
-    # Kopfzeile
-    try:
-        await update.effective_chat.send_message(
-            "👀 Watchlist (nach 24h-Volumen absteigend):",
-            parse_mode=ParseMode.HTML
+    # Text
+    header = "📋 <b>Watchlist (nach Vol24)</b>\n"
+    body_lines = []
+    for mint, m in rows:
+        body_lines.append(
+            f"- <a href=\"{m.get('url')}\">{m.get('name')}</a> ({_short_mint(mint)})\n"
+            f"  • age={m.get('age','n/a')}  • mcap≈{_fmt_usd_watch(m.get('mcap'))}  "
+            f"• vol24≈{_fmt_usd_watch(m.get('vol24'))}  • tx={m.get('tx','n/a')}  "
+            f"• liq≈{_fmt_usd_watch(m.get('liq'))}  • price={_fmt_usd_watch(m.get('price'))}"
         )
+    text = header + "\n".join(body_lines)
+
+    # Nur Refresh-Button
+    keyboard = InlineKeyboardMarkup([
+        [InlineKeyboardButton("🔁 Refresh", callback_data="WL:REFRESH")]
+    ])
+
+    await context.bot.send_message(
+        chat_id=update.effective_chat.id,
+        text=text,
+        reply_markup=keyboard,
+        parse_mode="HTML",
+        disable_web_page_preview=True
+    )
+
+    # Separates Remove-Panel (kompakt)
+    try:
+        rm_buttons, row = [], []
+        for mint, _ in rows[:25]:
+            row.append(InlineKeyboardButton(f"🗑 {_short_mint(mint)}", callback_data=f"WL:RM:{mint}"))
+            if len(row) == 3:
+                rm_buttons.append(row); row = []
+        if row: rm_buttons.append(row)
+        if rm_buttons:
+            await context.bot.send_message(
+                chat_id=update.effective_chat.id,
+                text="Schnell entfernen:",
+                reply_markup=InlineKeyboardMarkup(rm_buttons)
+            )
     except Exception:
         pass
 
-    # Ausgabe pro Token + Buttons
-    for (mint, html_name_link, age_txt, mcap_usd, vol24_usd) in results:
-        # OPEN-Status
-        pos = OPEN_POS.get(mint)
-        open_txt = ""
-        if pos and getattr(pos, "qty", 0.0) > 0:
-            try:
-                open_txt = f" • <b>OPEN</b> qty={pos.qty:.6f} @ {pos.entry_price:.6f}"
-            except Exception:
-                open_txt = " • <b>OPEN</b>"
-
-        text = (
-            f"- {html_name_link} ({mint[:6]}…)\n"
-            f"  • age={age_txt}  • mcap≈{_fmt_usd(mcap_usd)}  • vol24≈{_fmt_usd(vol24_usd)}{open_txt}"
-        )
-
-        kb = InlineKeyboardMarkup([
-            [InlineKeyboardButton("🗑 Remove", callback_data=f"rmw|{mint}")],
-            [InlineKeyboardButton("DexScreener", url=f"https://dexscreener.com/solana/{mint}")]
-        ])
-
-        try:
-            await update.effective_chat.send_message(
-                text,
-                reply_markup=kb,
-                parse_mode=ParseMode.HTML,
-                disable_web_page_preview=True
-            )
-        except Exception:
-            # letzte, minimalistische Fallback-Ausgabe
-            try:
-                await send(
-                    update,
-                    f"{mint[:6]}…\n age={age_txt}  mcap≈{_fmt_usd(mcap_usd)}  vol24≈{_fmt_usd(vol24_usd)}{open_txt}\n"
-                    f"https://dexscreener.com/solana/{mint}"
-                )
-            except Exception:
-                pass
-
-
-#===============================================================================
-
-async def cmd_add_watch(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not guard(update): return
-    if not context.args: return await send(update,"/add_watch <MINT>")
-    m=context.args[0].strip()
-    if m not in WATCHLIST: WATCHLIST.append(m)
-    await send(update, f"✅ hinzugefügt: {m}")
-#===============================================================================
-
-async def cmd_remove_watch(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not guard(update):
-        return
-    if not context.args:
-        return await send(update, "/remove_watch <MINT>")
-    m = context.args[0].strip()
-    if m in WATCHLIST:
-        WATCHLIST.remove(m)
-        # <<< FIX: State freigeben, falls keine offene Position
-        if m not in OPEN_POS:
-            _drop_mint_state(m)
-        await send(update, f"🗑️ entfernt: {m}")
-    else:
-        await send(update, f"ℹ️ nicht in Watchlist: {m}")
 
 #===============================================================================
 async def cmd_dashboard(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -5765,9 +6215,6 @@ async def build_app():
     app = Application.builder().token(TELEGRAM_BOT_TOKEN).request(req).build()
     app.add_handler(CommandHandler("start",        cmd_start))
     app.add_handler(CommandHandler("status",       cmd_status))
-    app.add_handler(CommandHandler("list_watch",   cmd_list_watch))
-    app.add_handler(CommandHandler("add_watch",    cmd_add_watch))
-    app.add_handler(CommandHandler("remove_watch", cmd_remove_watch))
     app.add_handler(CommandHandler("open_trades",  cmd_open_trades))
     app.add_handler(CommandHandler("buy",          cmd_buy))
     app.add_handler(CommandHandler("sell_all",     cmd_sell_all))
@@ -5782,7 +6229,6 @@ async def build_app():
     app.add_handler(CommandHandler("shutdown",     cmd_shutdown))
     app.add_handler(CommandHandler("health",       cmd_health))
     app.add_handler(CommandHandler("chart",        cmd_chart))
-    app.add_handler(CallbackQueryHandler(on_cb_remove_watch, pattern=r"^rmw\|"))
     app.add_handler(CommandHandler("scan_ds", cmd_scan_ds))
     app.add_handler(CallbackQueryHandler(on_scan_add_callback, pattern=r"^scanadd\|"))
     app.add_handler(CommandHandler("dsdiag", cmd_dsdiag))
@@ -5805,6 +6251,16 @@ async def build_app():
     app.add_handler(CallbackQueryHandler(on_observe_add_callback,  pattern=r"^obsadd\|"))
     app.add_handler(CallbackQueryHandler(on_observe_remove_callback, pattern=r"^obsrm\|"))
     app.add_handler(CommandHandler("diag_webhook", cmd_diag_webhook))
+    app.add_handler(CommandHandler("pnl",         cmd_pnl))
+    app.add_handler(CommandHandler("pnl_tail",    cmd_pnl_tail))
+    app.add_handler(CommandHandler("pnl_csv",     cmd_pnl_csv))
+    app.add_handler(CommandHandler("pnl_csv_all", cmd_pnl_csv_all))
+    app.add_handler(CommandHandler("pnl_chart",   cmd_pnl_chart))
+    app.add_handler(CallbackQueryHandler(cb_pnl_buttons, pattern=r"^PNL:(CHART|CSV|CSVALL)$"))
+    app.add_handler(CommandHandler("watchlist",    cmd_watchlist_compact))
+    app.add_handler(CommandHandler("add_watch",    cmd_add_watch))
+    app.add_handler(CommandHandler("remove_watch", cmd_remove_watch))
+    app.add_handler(CallbackQueryHandler(cb_watchlist_buttons, pattern=r"^WL:(REFRESH|RM:.+)$"))
     return app
 
 POLLING_STARTED = False
