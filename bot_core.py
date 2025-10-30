@@ -2562,8 +2562,12 @@ async def sell_all(mint: str) -> dict:
 
 async def cmd_pnl(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """
-    P&L mit Realized/Unrealized + Trades-Stats (Day/Week/Total) und
-    Max-Drawdown je Zeitraum. Belegt außerdem die CSV als Dokument.
+    P&L mit:
+      • Realized (Day/Week/Total) + Token-Anzahl
+      • Max Drawdown (Day/Week/Total)
+      • Trade-Statistik (Day/Week/Total): Trades, Wins, Losses, Flat, Hit-Rate
+      • Unrealized (Open)
+      • kleines Balkendiagramm (Realized Day/Week/Total)
     """
     if not guard(update):
         return
@@ -2577,14 +2581,16 @@ async def cmd_pnl(update: Update, context: ContextTypes.DEFAULT_TYPE):
     ts_day0 = int(dt_day0.timestamp())
     ts_week = int(now - 7 * 86400)
 
-    # ---- Helfer: Realized & Max-Drawdown eines Zeitfensters ----
-    def _realized_and_maxdd(rows: list, ts_from: int | None) -> tuple[float, float, int, int]:
+    # ---- Helfer: Stats für ein Zeitfenster ----
+    def _stats_window(rows: list, ts_from: int | None):
         """
-        returns (realized_sum, max_drawdown, n_trades, n_tokens)
-        - zählt nur SELL/PAPER-SELL-Zeilen (Executions)
-        - DD via kumulierte Realized-Equity
+        returns:
+          realized_sum_f, max_dd_f, n_trades, n_tokens, wins, losses, flats, hit_rate_f
+        - berücksichtigt nur SELL-/PAPER-SELL-Zeilen (Executions)
+        - DD via kumulierter Realized-Equity (chronologische SELLs)
+        - Hit-Rate: Wins / (Wins + Losses) in %
         """
-        # Filter nur SELL-Zeilen ab ts_from
+        # Executions filtern
         exec_rows = []
         for r in rows:
             side = (r.get("side") or "").upper()
@@ -2598,36 +2604,66 @@ async def cmd_pnl(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 continue
             exec_rows.append(r)
 
-        # Sum Realized
+        # Summen / Zähler
         realized_sum = Decimal("0")
-        for r in exec_rows:
-            realized_sum += _realized_from_row(r)
+        wins = 0
+        losses = 0
+        flats = 0
+        tokens = set()
 
-        # Max Drawdown der kumulierten Realized-Equity
+        # für DD: kumulierte Equity (nur SELLs), chronologisch
+        exec_rows.sort(key=lambda x: int(x.get("ts") or 0))
         eq = Decimal("0")
         peak = Decimal("0")
         max_dd = Decimal("0")
-        # chronologisch
-        exec_rows.sort(key=lambda x: int(x.get("ts") or 0))
+
         for r in exec_rows:
-            eq += _realized_from_row(r)
+            # Token-Set
+            mint = (r.get("mint") or "").strip()
+            if mint:
+                tokens.add(mint)
+
+            # realized dieses Trades
+            realized = _realized_from_row(r)
+            realized_sum += realized
+
+            # Wins/Losses/Flat
+            if realized > 0:
+                wins += 1
+            elif realized < 0:
+                losses += 1
+            else:
+                flats += 1
+
+            # Drawdown-Tracking
+            eq += realized
             if eq > peak:
                 peak = eq
             dd = peak - eq
             if dd > max_dd:
                 max_dd = dd
 
-        # Trades & Tokens
         n_trades = len(exec_rows)
-        n_tokens = len({(r.get("mint") or "").strip() for r in exec_rows if (r.get("mint") or "").strip()})
+        n_tokens = len(tokens)
+        denom = wins + losses
+        hit_rate = (wins / denom * 100.0) if denom > 0 else 0.0
 
         q2 = lambda x: float(Decimal(str(x)).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP))
-        return q2(realized_sum), q2(max_dd), n_trades, n_tokens
+        return (
+            q2(realized_sum),
+            q2(max_dd),
+            n_trades,
+            n_tokens,
+            wins,
+            losses,
+            flats,
+            q2(hit_rate),
+        )
 
     # --- Day / Week / Total ---
-    realized_day,  dd_day,  trades_day,  tokens_day  = _realized_and_maxdd(rows, ts_day0)
-    realized_week, dd_week, trades_week, tokens_week = _realized_and_maxdd(rows, ts_week)
-    realized_total, dd_total, trades_total, tokens_total = _realized_and_maxdd(rows, None)
+    (realized_day,  dd_day,  trades_day,  tokens_day,  wins_day,  losses_day,  flats_day,  hit_day)  = _stats_window(rows, ts_day0)
+    (realized_week, dd_week, trades_week, tokens_week, wins_week, losses_week, flats_week, hit_week) = _stats_window(rows, ts_week)
+    (realized_total,dd_total,trades_total,tokens_total,wins_total,losses_total,flats_total,hit_total) = _stats_window(rows, None)
 
     # --- Balkendiagramm (Realized) ---
     labels = ["Day", "Week", "Total"]
@@ -2648,26 +2684,43 @@ async def cmd_pnl(update: Update, context: ContextTypes.DEFAULT_TYPE):
     except Exception:
         pass
 
-    # --- Unrealized + offene Positionen (wie gehabt) ---
+    # --- Unrealized + offene Positionen ---
     unrealized_total, _rows_unreal = total_unreal_pnl()
 
-    # --- Ausgabe-Text (logisch getrennt nach PnL und Drawdown) ---
+    # --- Ausgabe-Text ---
     lines = [
         "📊 <b>P&L – Übersicht</b>",
         "",
         "💰 <b>Realized</b>",
-        f"• Day:   {realized_day:+,.2f} USD   (Trades: {trades_day},  Tokens: {tokens_day})",
-        f"• Week:  {realized_week:+,.2f} USD  (Trades: {trades_week}, Tokens: {tokens_week})",
-        f"• Total: {realized_total:+,.2f} USD  (Trades: {trades_total}, Tokens: {tokens_total})",
+        f"• Day:   {realized_day:+,.2f} USD   (Tokens: {tokens_day})",
+        f"• Week:  {realized_week:+,.2f} USD  (Tokens: {tokens_week})",
+        f"• Total: {realized_total:+,.2f} USD  (Tokens: {tokens_total})",
         f"• Unrealized (Open): {unrealized_total:+,.2f} USD",
         "",
         "📉 <b>Max Drawdown</b>",
         f"• Day:   {(-dd_day):+,.2f} USD",
         f"• Week:  {(-dd_week):+,.2f} USD",
         f"• Total: {(-dd_total):+,.2f} USD",
+        "",
+        "📈 <b>Trade-Stats</b>",
+        f"• Day:   Trades (executions): {trades_day} | Wins: {wins_day} | Losses: {losses_day} | Flat: {flats_day} | Hit-Rate: {hit_day:.1f}%",
+        f"• Week:  Trades (executions): {trades_week} | Wins: {wins_week} | Losses: {losses_week} | Flat: {flats_week} | Hit-Rate: {hit_week:.1f}%",
+        f"• Total: Trades (executions): {trades_total} | Wins: {wins_total} | Losses: {losses_total} | Flat: {flats_total} | Hit-Rate: {hit_total:.1f}%",
     ]
 
     await update.effective_chat.send_message("\n".join(lines), parse_mode=ParseMode.HTML)
+
+    # CSV anhängen
+    if os.path.exists(PNL_CSV):
+        try:
+            with open(PNL_CSV, "rb") as f:
+                await update.effective_chat.send_document(
+                    document=f,
+                    filename=os.path.basename(PNL_CSV),
+                    caption="📄 Trades/PNL-CSV (v2)"
+                )
+        except Exception:
+            pass
 
     # CSV anhängen (optional)
     if os.path.exists(PNL_CSV):
